@@ -1,0 +1,27 @@
+const jwt = require('jsonwebtoken');
+
+function auth(requiredRoles = []) {
+  return (req, res, next) => {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+    if (!token) {
+      return res.status(401).json({ message: 'Token não informado.' });
+    }
+
+    try {
+      const payload = jwt.verify(token, process.env.JWT_SECRET);
+      req.user = payload;
+
+      if (requiredRoles.length && !requiredRoles.includes(payload.role)) {
+        return res.status(403).json({ message: 'Sem permissão para esta ação.' });
+      }
+
+      next();
+    } catch (error) {
+      return res.status(401).json({ message: 'Token inválido.' });
+    }
+  };
+}
+
+module.exports = auth;

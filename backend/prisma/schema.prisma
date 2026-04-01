@@ -1,0 +1,268 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id               String           @id @default(cuid())
+  name             String
+  email            String           @unique
+  passwordHash     String
+  role             String
+  isActive         Boolean          @default(true)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  assignments      Assignment[]
+  payments         Payment[]
+  auditLogs        AuditLog[]
+  createdCustomers Customer[]       @relation("CustomerCreatedBy")
+  soldContracts    Contract[]       @relation("ContractSeller")
+  stockMovements   StockMovement[]
+  basketMovements  BasketMovement[]
+  spcRecords       SpcRecord[]
+}
+
+model Customer {
+  id              String           @id @default(cuid())
+  cpf             String           @unique
+  name            String
+  zipCode         String?
+  street          String
+  number          String
+  complement      String?
+  neighborhood    String
+  city            String
+  state           String
+  birthDate       DateTime
+  phone1          String
+  phone2          String?
+  monthlyIncome   Float
+  residenceMonths Int
+  status          String           @default("ATIVO")
+  notes           String?
+  createdById     String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  createdBy       User?            @relation("CustomerCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  contracts       Contract[]
+  stockMovements  StockMovement[]
+  basketMovements BasketMovement[]
+  spcRecords      SpcRecord[]
+}
+
+model Contract {
+  id                   String           @id @default(cuid())
+  customerId           String
+  sellerId             String?
+  product              String
+  financedAmount       Float
+  installmentCount     Int
+  contractStartDate    DateTime
+  interestRate         Float
+  notes                String?
+  status               String           @default("ATIVO")
+  promisedPaymentDate  DateTime?
+  promisedPaymentValue Float?
+  collectionNote       String?
+  renegotiatedFromId   String?
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
+  customer             Customer         @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  seller               User?            @relation("ContractSeller", fields: [sellerId], references: [id], onDelete: SetNull)
+  payments             Payment[]
+  assignments          Assignment[]
+  installments         Installment[]
+  stockMovements       StockMovement[]
+  basketMovements      BasketMovement[]
+  spcRecords           SpcRecord[]
+}
+
+model Installment {
+  id          String    @id @default(cuid())
+  contractId  String
+  number      Int
+  dueDate     DateTime
+  amount      Float
+  paidAmount  Float     @default(0)
+  status      String    @default("PENDENTE")
+  paidAt      DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  contract    Contract  @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  payments    Payment[]
+
+  @@unique([contractId, number])
+}
+
+model Assignment {
+  id           String   @id @default(cuid())
+  contractId   String
+  collectorId  String
+  targetAmount Float?
+  notes        String?
+  assignedAt   DateTime @default(now())
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  contract     Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  collector    User     @relation(fields: [collectorId], references: [id], onDelete: Cascade)
+
+  @@unique([contractId, collectorId])
+}
+
+model Payment {
+  id            String       @id @default(cuid())
+  contractId    String
+  installmentId String?
+  collectorId   String
+  amount        Float
+  paymentDate   DateTime
+  paymentMethod String
+  notes         String?
+  receiptCode   String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  contract      Contract     @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  collector     User         @relation(fields: [collectorId], references: [id], onDelete: Cascade)
+  installment   Installment? @relation(fields: [installmentId], references: [id], onDelete: SetNull)
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  userId      String?
+  action      String
+  entityType  String
+  entityId    String
+  description String?
+  metadata    String?
+  createdAt   DateTime @default(now())
+  user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+}
+
+model Product {
+  id           String          @id @default(cuid())
+  name         String
+  description  String?
+  unit         String          @default("un")
+  costPrice    Float           @default(0)
+  salePrice    Float           @default(0)
+  currentStock Float           @default(0)
+  minStock     Float           @default(0)
+  expiryDate   DateTime?
+  packageUnit  String?
+  packageQty   Float?
+  isActive     Boolean         @default(true)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  movements    StockMovement[]
+  basketItems  BasketItem[]
+}
+
+model StockMovement {
+  id          String    @id @default(cuid())
+  productId   String
+  type        String
+  quantity    Float
+  unitCost    Float     @default(0)
+  salePrice   Float?
+  margin      Float?
+  destination String?
+  contractId  String?
+  customerId  String?
+  reason      String?
+  notes       String?
+  userId      String?
+  createdAt   DateTime  @default(now())
+  product     Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  contract    Contract? @relation(fields: [contractId], references: [id], onDelete: SetNull)
+  customer    Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  user        User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+}
+
+model Basket {
+  id           String           @id @default(cuid())
+  name         String
+  description  String?
+  salePrice    Float            @default(0)
+  costPrice    Float            @default(0)
+  margin       Float            @default(0)
+  currentStock Float            @default(0)
+  isActive     Boolean          @default(true)
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  items        BasketItem[]
+  movements    BasketMovement[]
+}
+
+model BasketItem {
+  id        String   @id @default(cuid())
+  basketId  String
+  productId String
+  quantity  Float
+  createdAt DateTime @default(now())
+  basket    Basket   @relation(fields: [basketId], references: [id], onDelete: Cascade)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([basketId, productId])
+}
+
+model BasketMovement {
+  id          String    @id @default(cuid())
+  basketId    String
+  type        String
+  quantity    Float
+  unitCost    Float     @default(0)
+  salePrice   Float?
+  margin      Float?
+  destination String?
+  customerId  String?
+  contractId  String?
+  reason      String?
+  notes       String?
+  userId      String?
+  createdAt   DateTime  @default(now())
+  basket      Basket    @relation(fields: [basketId], references: [id], onDelete: Cascade)
+  customer    Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  contract    Contract? @relation(fields: [contractId], references: [id], onDelete: SetNull)
+  user        User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+}
+
+model SpcRecord {
+  id            String         @id @default(cuid())
+  customerId    String
+  contractId    String?
+  debtAmount    Float
+  originalDebt  Float
+  status        String         @default("ATIVO")
+  reason        String?
+  includeDate   DateTime       @default(now())
+  expireDate    DateTime
+  removedDate   DateTime?
+  removedReason String?
+  notes         String?
+  createdById   String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  customer      Customer       @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  contract      Contract?      @relation(fields: [contractId], references: [id], onDelete: SetNull)
+  createdBy     User?          @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  agreements    SpcAgreement[]
+}
+
+model SpcAgreement {
+  id           String    @id @default(cuid())
+  spcRecordId  String
+  agreedAmount Float
+  installments Int       @default(1)
+  dueDate      DateTime
+  paidAmount   Float     @default(0)
+  status       String    @default("PENDENTE")
+  notes        String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  spcRecord    SpcRecord @relation(fields: [spcRecordId], references: [id], onDelete: Cascade)
+}
