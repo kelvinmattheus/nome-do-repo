@@ -22,3 +22,9 @@ npm-debug.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code (configurações locais)
+.claude/
+
+# TypeScript build info
+*.tsbuildinfo

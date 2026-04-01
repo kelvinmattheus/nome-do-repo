@@ -1,0 +1,153 @@
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,300&family=DM+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+/* ── BlueCredit Pro: design tokens ─────────────────────────── */
+@layer base {
+  :root {
+    --blue-950: #04101f;
+    --blue-900: #071a33;
+    --blue-800: #0d2d56;
+    --blue-700: #133d74;
+    --blue-600: #1a52a0;
+    --blue-500: #2367c4;
+    --blue-400: #4285e0;
+    --blue-300: #7aaeed;
+    --blue-200: #b3d0f7;
+    --blue-100: #ddeafe;
+    --blue-50:  #f0f6ff;
+
+    --gold-500: #c49a2e;
+    --gold-400: #d4b04a;
+    --gold-300: #e2c96e;
+    --gold-100: #faf3dc;
+
+    --slate-900: #0f1623;
+    --slate-800: #1a2235;
+    --slate-700: #253047;
+    --slate-600: #374259;
+    --slate-500: #536078;
+    --slate-400: #7b8fa6;
+    --slate-300: #a8baca;
+    --slate-200: #ccd9e5;
+    --slate-100: #e8eef5;
+    --slate-50:  #f5f8fb;
+
+    --green-500: #1a9c5b;
+    --green-100: #d4f0e3;
+    --red-500:   #d63d3d;
+    --red-100:   #fce8e8;
+    --amber-500: #c47a1a;
+    --amber-100: #fef0d4;
+    --purple-500: #7c4dce;
+    --purple-100: #ece6fb;
+
+    --shadow-sm: 0 2px 8px rgba(0,0,0,.07), 0 1px 3px rgba(0,0,0,.05);
+    --shadow-md: 0 4px 20px rgba(0,0,0,.09), 0 2px 6px rgba(0,0,0,.05);
+    --shadow-blue: 0 4px 24px rgba(35,103,196,.18);
+
+    --font-display: 'Sora', sans-serif;
+    --font-body: 'DM Sans', sans-serif;
+    --font-mono: 'DM Mono', monospace;
+
+    /* shadcn semantic tokens */
+    --background:            oklch(0.975 0.005 240);
+    --foreground:            oklch(0.18  0.03  240);
+    --card:                  oklch(1     0     0);
+    --card-foreground:       oklch(0.18  0.03  240);
+    --popover:               oklch(1     0     0);
+    --popover-foreground:    oklch(0.18  0.03  240);
+    --primary:               oklch(0.48  0.18  240);
+    --primary-foreground:    oklch(0.985 0     0);
+    --secondary:             oklch(0.96  0.01  240);
+    --secondary-foreground:  oklch(0.25  0.04  240);
+    --muted:                 oklch(0.96  0.01  240);
+    --muted-foreground:      oklch(0.52  0.04  240);
+    --accent:                oklch(0.93  0.03  240);
+    --accent-foreground:     oklch(0.25  0.04  240);
+    --destructive:           oklch(0.58  0.23  27);
+    --border:                oklch(0.91  0.02  240);
+    --input:                 oklch(0.91  0.02  240);
+    --ring:                  oklch(0.48  0.18  240);
+    --radius:                0.625rem;
+
+    --sidebar:                     oklch(0.10  0.04  240);
+    --sidebar-foreground:          oklch(0.9   0.02  240);
+    --sidebar-primary:             oklch(0.55  0.18  240);
+    --sidebar-primary-foreground:  oklch(0.985 0     0);
+    --sidebar-accent:              oklch(0.18  0.05  240);
+    --sidebar-accent-foreground:   oklch(0.9   0.02  240);
+    --sidebar-border:              oklch(0.22  0.05  240);
+    --sidebar-ring:                oklch(0.55  0.18  240);
+  }
+
+  * {
+    border-color: var(--border);
+    outline-color: color-mix(in oklch, var(--ring) 50%, transparent);
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-body);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  html {
+    font-family: var(--font-body);
+  }
+}
+
+/* ── Tailwind v4: mapeia CSS vars como utilidades ─────────── */
+@theme inline {
+  /* Semantic colors */
+  --color-background:           var(--background);
+  --color-foreground:           var(--foreground);
+  --color-card:                 var(--card);
+  --color-card-foreground:      var(--card-foreground);
+  --color-popover:              var(--popover);
+  --color-popover-foreground:   var(--popover-foreground);
+  --color-primary:              var(--primary);
+  --color-primary-foreground:   var(--primary-foreground);
+  --color-secondary:            var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted:                var(--muted);
+  --color-muted-foreground:     var(--muted-foreground);
+  --color-accent:               var(--accent);
+  --color-accent-foreground:    var(--accent-foreground);
+  --color-destructive:          var(--destructive);
+  --color-border:               var(--border);
+  --color-input:                var(--input);
+  --color-ring:                 var(--ring);
+
+  --color-sidebar:                    var(--sidebar);
+  --color-sidebar-foreground:         var(--sidebar-foreground);
+  --color-sidebar-primary:            var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent:             var(--sidebar-accent);
+  --color-sidebar-accent-foreground:  var(--sidebar-accent-foreground);
+  --color-sidebar-border:             var(--sidebar-border);
+  --color-sidebar-ring:               var(--sidebar-ring);
+
+  /* Border radius */
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+
+  /* Typography */
+  --font-family-sans:    var(--font-body),    'DM Sans',  sans-serif;
+  --font-family-display: var(--font-display), 'Sora',     sans-serif;
+  --font-family-mono:    var(--font-mono),    'DM Mono',  monospace;
+}
+
+/* ── Utilities extras ─────────────────────────────────────── */
+@utility text-balance {
+  text-wrap: balance;
+}
+
+@utility font-mono-nums {
+  font-family: 'DM Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
