@@ -125,6 +125,15 @@ const { RangePicker } = DatePicker;
 const money = (value) =>
   Number(value || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 
+function useDebounce(value, delay = 300) {
+  const [debouncedValue, setDebouncedValue] = React.useState(value);
+  React.useEffect(() => {
+    const timer = setTimeout(() => setDebouncedValue(value), delay);
+    return () => clearTimeout(timer);
+  }, [value, delay]);
+  return debouncedValue;
+}
+
 const dateBR = (value) => (value ? dayjs.utc(value).format('DD/MM/YYYY') : '-');
 const dateTimeBR = (value) => (value ? dayjs.utc(value).format('DD/MM/YYYY HH:mm') : '-');
 const ageFromDate = (value) => (value ? dayjs().diff(dayjs(value), 'year') : 0);
@@ -521,6 +530,8 @@ function AppContent() {
   const [productDrawer, setProductDrawer] = useState({ open: false, item: null });
   const [movementModal, setMovementModal] = useState({ open: false, type: 'ENTRADA' });
 
+  const [submitting, setSubmitting] = useState(false);
+
   const [cashMonth, setCashMonth] = useState(dayjs());
   const [cashCollectorId, setCashCollectorId] = useState(undefined);
   const [cashAccounts, setCashAccounts] = useState([]);
@@ -534,6 +545,10 @@ function AppContent() {
   const [contractStatusFilter, setContractStatusFilter] = useState('');
   const [paymentSearch, setPaymentSearch] = useState('');
   const [paymentDateRange, setPaymentDateRange] = useState(null);
+
+  const debouncedCustomerSearch = useDebounce(customerSearch);
+  const debouncedContractSearch = useDebounce(contractSearch);
+  const debouncedPaymentSearch  = useDebounce(paymentSearch);
 
   const [loginForm] = Form.useForm();
   const [customerForm] = Form.useForm();
@@ -639,8 +654,12 @@ function AppContent() {
     return base;
   }, [isAdmin, isCollector]);
 
+  const loadingRef = React.useRef(false);
+
   const loadAll = useCallback(async () => {
     if (!token) return;
+    if (loadingRef.current) return;
+    loadingRef.current = true;
 
     try {
       setLoading(true);
@@ -719,9 +738,9 @@ function AppContent() {
       }
     } catch (error) {
       console.error('loadAll error:', error?.response?.data?.message || error?.message);
-      // Não usar ant.message aqui para evitar loop
     } finally {
       setLoading(false);
+      loadingRef.current = false;
     }
   }, [token, isAdmin, isCollector]);
 
@@ -731,7 +750,7 @@ function AppContent() {
 
   const filteredCustomers = useMemo(() => {
     return customers.filter((customer) => {
-      const q = customerSearch.trim().toLowerCase();
+      const q = debouncedCustomerSearch.trim().toLowerCase();
       const matchesSearch =
         !q ||
         customer.name?.toLowerCase().includes(q) ||
@@ -740,11 +759,11 @@ function AppContent() {
       const matchesStatus = !customerStatusFilter || customer.status === customerStatusFilter;
       return matchesSearch && matchesStatus;
     });
-  }, [customers, customerSearch, customerStatusFilter]);
+  }, [customers, debouncedCustomerSearch, customerStatusFilter]);
 
   const filteredContracts = useMemo(() => {
     return contracts.filter((contract) => {
-      const q = contractSearch.trim().toLowerCase();
+      const q = debouncedContractSearch.trim().toLowerCase();
       const matchesSearch =
         !q ||
         contract.customer?.name?.toLowerCase().includes(q) ||
@@ -754,12 +773,12 @@ function AppContent() {
       const matchesStatus = !contractStatusFilter || contract.status === contractStatusFilter;
       return matchesSearch && matchesStatus;
     });
-  }, [contracts, contractSearch, contractStatusFilter]);
+  }, [contracts, debouncedContractSearch, contractStatusFilter]);
 
   // CORRIGIDO: lógica de filtro de data estava com ternário errado
   const filteredPayments = useMemo(() => {
     return payments.filter((payment) => {
-      const q = paymentSearch.trim().toLowerCase();
+      const q = debouncedPaymentSearch.trim().toLowerCase();
       const matchesSearch =
         !q ||
         payment.contract?.customer?.name?.toLowerCase().includes(q) ||
@@ -777,7 +796,7 @@ function AppContent() {
 
       return matchesSearch && matchesDate;
     });
-  }, [payments, paymentSearch, paymentDateRange]);
+  }, [payments, debouncedPaymentSearch, paymentDateRange]);
 
   function persistAuth(nextToken, nextUser) {
     localStorage.setItem('token', nextToken);
@@ -935,12 +954,22 @@ function AppContent() {
   }
 
   function openRenegotiation(contract) {
-    setRenegotiationModal({ open: true, contract });
-    renegotiationForm.setFieldsValue({
-      installmentCount: Math.max(contract.remainingInstallments || 1, 1),
-      contractStartDate: dayjs(),
-      interestRate: contract.interestRate || 0,
-      notes: `Renegociação do contrato ${contract.product}`
+    ant.modal.confirm({
+      title: 'Confirmar renegociação',
+      content: `O contrato "${contract.product}" de ${contract.customer?.name} será marcado como Renegociado e um novo contrato será criado com o saldo devedor. Esta ação não pode ser desfeita. Deseja continuar?`,
+      okText: 'Sim, renegociar',
+      okButtonProps: { danger: true },
+      cancelText: 'Cancelar',
+      centered: true,
+      onOk: () => {
+        setRenegotiationModal({ open: true, contract });
+        renegotiationForm.setFieldsValue({
+          installmentCount: Math.max(contract.remainingInstallments || 1, 1),
+          contractStartDate: dayjs(),
+          interestRate: contract.interestRate || 0,
+          notes: `Renegociação do contrato ${contract.product}`
+        });
+      }
     });
   }
 
@@ -971,6 +1000,8 @@ function AppContent() {
   }
 
   async function saveCustomer(values) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       const payload = {
         ...values,
@@ -994,10 +1025,14 @@ function AppContent() {
       });
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao salvar cliente.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function saveContract(values) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       const payload = {
         ...values,
@@ -1038,10 +1073,14 @@ function AppContent() {
       );
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao salvar contrato.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function savePayment(values) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       const payload = {
         ...values,
@@ -1076,10 +1115,14 @@ function AppContent() {
       });
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao salvar pagamento.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function saveUser(values) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       if (userDrawer.item) {
         await api.put(`/users/${userDrawer.item.id}`, values);
@@ -1098,10 +1141,14 @@ function AppContent() {
       });
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao salvar usuário.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function saveBulkDistribution() {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       await api.post('/distribution/bulk', {
         collectorId: bulkDrawer.collector.id,
@@ -1117,10 +1164,14 @@ function AppContent() {
       });
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao distribuir contratos.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function submitRenegotiation(values) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       await api.post(`/contracts/${renegotiationModal.contract.id}/renegotiate`, {
         installmentCount: values.installmentCount,
@@ -1138,6 +1189,8 @@ function AppContent() {
       });
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao renegociar contrato.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -1293,6 +1346,8 @@ function AppContent() {
   }
 
   async function saveSpc(values) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       if (spcDrawer.item) {
         await api.put(`/spc/${spcDrawer.item.id}`, values);
@@ -1308,11 +1363,15 @@ function AppContent() {
       await loadSpcData();
       ant.message.success(spcDrawer.item ? 'Registro atualizado.' : 'Cliente incluido no SPC.', 2);
     } catch (e) {
-      ant.message.error(e?.response?.data?.message || 'Erro ao salvar.', 3);
+      ant.message.error(e?.response?.data?.message || 'Erro ao salvar registro SPC.', 3);
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function saveBaixar(values) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       await api.put(`/spc/${spcBaixarModal.item.id}/baixar`, values);
       setSpcBaixarModal({ open: false, item: null });
@@ -1321,10 +1380,14 @@ function AppContent() {
       ant.message.success('Registro baixado com sucesso.', 2);
     } catch (e) {
       ant.message.error(e?.response?.data?.message || 'Erro ao baixar.', 3);
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function saveAcordo(values) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       await api.post(`/spc/${spcAcordoModal.item.id}/acordo`, {
         ...values,
@@ -1336,16 +1399,22 @@ function AppContent() {
       ant.message.success('Acordo registrado.', 2);
     } catch (e) {
       ant.message.error(e?.response?.data?.message || 'Erro ao registrar acordo.', 3);
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function deleteSpc(id) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       await api.delete(`/spc/${id}`);
       await loadSpcData();
       ant.message.success('Registro excluido.', 2);
     } catch (e) {
-      ant.message.error('Erro ao excluir.', 3);
+      ant.message.error(e?.response?.data?.message || 'Erro ao excluir registro SPC.', 3);
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -1388,6 +1457,8 @@ function AppContent() {
   }
 
   async function saveAdjust(values) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       const endpoint = adjustModal.target === 'stock'
         ? '/stock/movements/adjust'
@@ -1409,10 +1480,14 @@ function AppContent() {
       ant.message.success('Ajuste registrado.');
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao registrar ajuste.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function saveEditMovement(values) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       const { item, target } = editMovementModal;
       const endpoint = target === 'stock'
@@ -1437,6 +1512,8 @@ function AppContent() {
       ant.message.success('Movimentação atualizada.');
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao editar movimentação.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -1470,7 +1547,16 @@ function AppContent() {
   }
 
   async function saveBasket(values) {
+    if (submitting) return;
     try {
+      if (!values.name?.trim()) {
+        ant.message.error('Nome da cesta é obrigatório.');
+        return;
+      }
+      if (!values.salePrice || Number(values.salePrice) <= 0) {
+        ant.message.error('Preço de venda deve ser maior que zero.');
+        return;
+      }
       const payload = { ...values, items: basketItems.filter(i => i.productId) };
       if (payload.items.length === 0) {
         ant.message.error('Adicione pelo menos um produto à cesta.');
@@ -1487,10 +1573,14 @@ function AppContent() {
       ant.message.success(basketDrawer.item ? 'Cesta atualizada.' : 'Cesta cadastrada.');
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao salvar cesta.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function deleteBasket(id) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       await api.delete(`/baskets/${id}`);
       const res = await api.get('/baskets');
@@ -1498,10 +1588,14 @@ function AppContent() {
       ant.message.success('Cesta removida.');
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao remover cesta.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function saveBasketMovement(values) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       await api.post('/baskets/movements', {
         ...values,
@@ -1518,6 +1612,8 @@ function AppContent() {
       ant.message.success('Movimentação registrada.');
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao registrar movimentação.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -1572,6 +1668,8 @@ function AppContent() {
   }
 
   async function saveProduct(values) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       const payload = {
         ...values,
@@ -1588,10 +1686,14 @@ function AppContent() {
       ant.message.success(productDrawer.item ? 'Produto atualizado.' : 'Produto cadastrado.');
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao salvar produto.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function deleteProduct(id) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       await api.delete(`/products/${id}`);
       const res = await api.get('/products');
@@ -1599,10 +1701,14 @@ function AppContent() {
       ant.message.success('Produto removido.');
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao remover produto.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function saveMovement(values) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       await api.post('/stock/movements', {
         ...values,
@@ -1622,6 +1728,8 @@ function AppContent() {
       ant.message.success('Movimentação registrada.');
     } catch (error) {
       ant.message.error(error?.response?.data?.message || 'Erro ao registrar movimentação.');
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -2311,8 +2419,8 @@ function AppContent() {
               allowClear
               options={[
                 { value: 'ATIVO', label: 'Ativo' },
-                { value: 'BLOQUEADO', label: 'Bloqueado' },
-                { value: 'INADIMPLENTE', label: 'Inadimplente' }
+                { value: 'INADIMPLENTE', label: 'Inadimplente' },
+                { value: 'INATIVO', label: 'Inativo' }
               ]}
             />
           </Col>
@@ -2327,6 +2435,7 @@ function AppContent() {
             dataSource={filteredCustomers}
             loading={loading}
             scroll={{ x: 700 }}
+            locale={{ emptyText: 'Nenhum cliente encontrado.' }}
           />
         )}
       </Card>
@@ -2386,6 +2495,7 @@ function AppContent() {
               dataSource={filteredContracts}
               loading={loading}
               scroll={{ x: 1200 }}
+              locale={{ emptyText: 'Nenhum contrato encontrado.' }}
             />
           </div>
         )}
@@ -2822,6 +2932,7 @@ function AppContent() {
           dataSource={products.filter(p => !unitFilter || p.unit === unitFilter)}
           loading={loading}
           scroll={{ x: 900 }}
+          locale={{ emptyText: 'Nenhum produto cadastrado.' }}
           columns={[
             { title: 'Produto', render: (_, r) => (
               <div>
@@ -3026,6 +3137,7 @@ function AppContent() {
             dataSource={filteredPayments}
             loading={loading}
             scroll={{ x: 1200 }}
+            locale={{ emptyText: 'Nenhum pagamento encontrado.' }}
           />
         )}
       </Card>
@@ -3137,6 +3249,7 @@ function AppContent() {
           dataSource={users}
           loading={loading}
           scroll={{ x: 900 }}
+          locale={{ emptyText: 'Nenhum usuário cadastrado.' }}
         />
       </Card>
     </Space>
@@ -3157,6 +3270,7 @@ function AppContent() {
           dataSource={auditLogs}
           loading={loading}
           scroll={{ x: 1200 }}
+          locale={{ emptyText: 'Nenhum registro de auditoria encontrado.' }}
         />
       </Card>
     </Space>
@@ -3282,6 +3396,7 @@ function AppContent() {
           dataSource={baskets}
           loading={loading}
           scroll={{ x: 900 }}
+          locale={{ emptyText: 'Nenhuma cesta cadastrada.' }}
           expandable={{
             expandedRowRender: basket => (
               <div style={{ padding: '6px 0' }}>
@@ -3413,6 +3528,7 @@ function AppContent() {
           dataSource={spcRecords}
           pagination={{ pageSize: 10 }}
           scroll={{ x: 900 }}
+          locale={{ emptyText: 'Nenhum registro SPC encontrado.' }}
           rowClassName={r => {
             if (r.status !== 'BAIXADO' && diasParaVencer(r.expireDate) <= 30) return 'spc-row-alert';
             return '';
@@ -3607,7 +3723,7 @@ function AppContent() {
         <Form layout="vertical" form={customerForm} onFinish={saveCustomer} initialValues={initialCustomer}>
           <Divider orientation="left">Dados principais</Divider>
           <Row gutter={16}>
-            <Col xs={24} md={12}><Form.Item name="cpf" label="CPF" rules={[{ required: true }]}><Input /></Form.Item></Col>
+            <Col xs={24} md={12}><Form.Item name="cpf" label="CPF" rules={[{ required: true, message: 'CPF obrigatório.' }, { pattern: /^\d{3}\.\d{3}\.\d{3}-\d{2}$/, message: 'CPF inválido (ex: 000.000.000-00).' }]}><Input placeholder="000.000.000-00" maxLength={14} onChange={(e) => { const digits = e.target.value.replace(/\D/g, '').slice(0, 11); const formatted = digits.length <= 3 ? digits : digits.length <= 6 ? `${digits.slice(0,3)}.${digits.slice(3)}` : digits.length <= 9 ? `${digits.slice(0,3)}.${digits.slice(3,6)}.${digits.slice(6)}` : `${digits.slice(0,3)}.${digits.slice(3,6)}.${digits.slice(6,9)}-${digits.slice(9)}`; customerForm.setFieldValue('cpf', formatted); }} /></Form.Item></Col>
             <Col xs={24} md={12}><Form.Item name="name" label="Nome" rules={[{ required: true }]}><Input /></Form.Item></Col>
             <Col xs={24} md={8}><Form.Item name="birthDate" label="Data de nascimento" rules={[{ required: true }]}><DatePicker style={{ width: '100%' }} format="DD/MM/YYYY" /></Form.Item></Col>
             <Col xs={24} md={6}>
@@ -3624,8 +3740,8 @@ function AppContent() {
                 <Select
                   options={[
                     { value: 'ATIVO', label: 'Ativo' },
-                    { value: 'BLOQUEADO', label: 'Bloqueado' },
-                    { value: 'INADIMPLENTE', label: 'Inadimplente' }
+                    { value: 'INADIMPLENTE', label: 'Inadimplente' },
+                    { value: 'INATIVO', label: 'Inativo' }
                   ]}
                 />
               </Form.Item>
@@ -3634,13 +3750,13 @@ function AppContent() {
 
           <Divider orientation="left">Contato</Divider>
           <Row gutter={16}>
-            <Col xs={24} md={12}><Form.Item name="phone1" label="Telefone 1" rules={[{ required: true }]}><Input /></Form.Item></Col>
-            <Col xs={24} md={12}><Form.Item name="phone2" label="Telefone 2"><Input /></Form.Item></Col>
+            <Col xs={24} md={12}><Form.Item name="phone1" label="Telefone 1" rules={[{ required: true, message: 'Telefone obrigatório.' }]}><Input placeholder="(00) 00000-0000" maxLength={15} onChange={(e) => { const d = e.target.value.replace(/\D/g, '').slice(0, 11); const f = d.length <= 2 ? d : d.length <= 7 ? `(${d.slice(0,2)}) ${d.slice(2)}` : `(${d.slice(0,2)}) ${d.slice(2,7)}-${d.slice(7)}`; customerForm.setFieldValue('phone1', f); }} /></Form.Item></Col>
+            <Col xs={24} md={12}><Form.Item name="phone2" label="Telefone 2"><Input placeholder="(00) 00000-0000" maxLength={15} onChange={(e) => { const d = e.target.value.replace(/\D/g, '').slice(0, 11); const f = d.length <= 2 ? d : d.length <= 7 ? `(${d.slice(0,2)}) ${d.slice(2)}` : `(${d.slice(0,2)}) ${d.slice(2,7)}-${d.slice(7)}`; customerForm.setFieldValue('phone2', f); }} /></Form.Item></Col>
           </Row>
 
           <Divider orientation="left">Endereço</Divider>
           <Row gutter={16}>
-            <Col xs={24} md={8}><Form.Item name="zipCode" label="CEP"><Input /></Form.Item></Col>
+            <Col xs={24} md={8}><Form.Item name="zipCode" label="CEP" rules={[{ pattern: /^\d{5}-\d{3}$/, message: 'CEP inválido (ex: 00000-000).' }]}><Input placeholder="00000-000" maxLength={9} onChange={(e) => { const d = e.target.value.replace(/\D/g, '').slice(0, 8); const f = d.length <= 5 ? d : `${d.slice(0,5)}-${d.slice(5)}`; customerForm.setFieldValue('zipCode', f); }} /></Form.Item></Col>
             <Col xs={24} md={12}><Form.Item name="street" label="Rua" rules={[{ required: true }]}><Input /></Form.Item></Col>
             <Col xs={24} md={4}><Form.Item name="number" label="Número" rules={[{ required: true }]}><Input /></Form.Item></Col>
             <Col xs={24} md={12}><Form.Item name="complement" label="Complemento"><Input /></Form.Item></Col>
@@ -3659,7 +3775,7 @@ function AppContent() {
             <Input.TextArea rows={4} />
           </Form.Item>
 
-          <Button type="primary" htmlType="submit" block>Salvar cliente</Button>
+          <Button type="primary" htmlType="submit" block loading={submitting} disabled={submitting}>Salvar cliente</Button>
         </Form>
       </Drawer>
 
@@ -3690,8 +3806,9 @@ function AppContent() {
                   optionFilterProp="label"
                   placeholder="Selecionar produto do estoque..."
                   onChange={(val) => {
-                    const prod = products.find(p => p.name === val);
-                    const basket = baskets.find(b => b.name === val);
+                    const v = String(val || '').trim().toLowerCase();
+                    const prod = products.find(p => p.name.trim().toLowerCase() === v);
+                    const basket = baskets.find(b => b.name.trim().toLowerCase() === v);
                     setSelectedContractProduct(prod ? { ...prod, isBasket: false } : basket ? { ...basket, isBasket: true } : null);
                     if (prod) contractForm.setFieldsValue({ financedAmount: prod.salePrice });
                     if (basket) contractForm.setFieldsValue({ financedAmount: basket.salePrice });
@@ -3782,13 +3899,13 @@ function AppContent() {
             <Col xs={24} md={12}><Form.Item name="financedAmount" label="Valor financiado" rules={[{ required: true }]}><InputNumber style={{ width: '100%' }} min={0} /></Form.Item></Col>
             <Col xs={24} md={12}><Form.Item name="installmentCount" label="Parcelas" rules={[{ required: true }]}><InputNumber style={{ width: '100%' }} min={1} /></Form.Item></Col>
             <Col xs={24} md={12}><Form.Item name="contractStartDate" label="Início do contrato" rules={[{ required: true }]}><DatePicker style={{ width: '100%' }} format="DD/MM/YYYY" /></Form.Item></Col>
-            <Col xs={24} md={12}><Form.Item name="interestRate" label="Juros (%)" rules={[{ required: true }]}><InputNumber style={{ width: '100%' }} min={0} /></Form.Item></Col>
+            <Col xs={24} md={12}><Form.Item name="interestRate" label="Juros (%)" rules={[{ required: true }]}><InputNumber style={{ width: '100%' }} min={0} step={0.01} /></Form.Item></Col>
           </Row>
 
           <Divider orientation="left">Cobrança</Divider>
           <Row gutter={16}>
             <Col xs={24} md={12}><Form.Item name="promisedPaymentDate" label="Promessa de pagamento"><DatePicker style={{ width: '100%' }} format="DD/MM/YYYY" /></Form.Item></Col>
-            <Col xs={24} md={12}><Form.Item name="promisedPaymentValue" label="Valor prometido"><InputNumber style={{ width: '100%' }} min={0} /></Form.Item></Col>
+            <Col xs={24} md={12}><Form.Item name="promisedPaymentValue" label="Valor prometido"><InputNumber style={{ width: '100%' }} min={0} step={0.01} /></Form.Item></Col>
           </Row>
 
           <Form.Item name="collectionNote" label="Anotação de cobrança">
@@ -3799,7 +3916,7 @@ function AppContent() {
             <Input.TextArea rows={4} />
           </Form.Item>
 
-          <Button type="primary" htmlType="submit" block>Salvar contrato</Button>
+          <Button type="primary" htmlType="submit" block loading={submitting} disabled={submitting}>Salvar contrato</Button>
         </Form>
       </Drawer>
 
@@ -3812,6 +3929,7 @@ function AppContent() {
         centered
         zIndex={2200}
         maskClosable={false}
+        destroyOnClose
         style={{ top: isMobile ? 10 : 20 }}
       >
         <Form layout="vertical" form={paymentForm} onFinish={savePayment}>
@@ -3869,7 +3987,7 @@ function AppContent() {
             <Input.TextArea rows={4} />
           </Form.Item>
 
-          <Button type="primary" htmlType="submit" block>Salvar pagamento</Button>
+          <Button type="primary" htmlType="submit" block loading={submitting} disabled={submitting}>Salvar pagamento</Button>
         </Form>
       </Modal>
 
@@ -3905,7 +4023,7 @@ function AppContent() {
               ]}
             />
           </Form.Item>
-          <Button type="primary" htmlType="submit" block>Salvar usuário</Button>
+          <Button type="primary" htmlType="submit" block loading={submitting} disabled={submitting}>Salvar usuário</Button>
         </Form>
       </Drawer>
 
@@ -3955,7 +4073,8 @@ function AppContent() {
         <Button
           type="primary"
           block
-          disabled={!selectedContractIds.length}
+          disabled={!selectedContractIds.length || submitting}
+          loading={submitting}
           onClick={saveBulkDistribution}
         >
           Distribuir contratos selecionados
@@ -4176,14 +4295,14 @@ function AppContent() {
               label="Novo juros (%)"
               rules={[{ required: true }]}
             >
-              <InputNumber style={{ width: '100%' }} min={0} />
+              <InputNumber style={{ width: '100%' }} min={0} step={0.01} />
             </Form.Item>
 
             <Form.Item name="notes" label="Observações">
               <Input.TextArea rows={4} />
             </Form.Item>
 
-            <Button type="primary" htmlType="submit" block>
+            <Button type="primary" htmlType="submit" block loading={submitting} disabled={submitting}>
               Confirmar renegociação
             </Button>
           </Form>
@@ -4196,10 +4315,11 @@ function AppContent() {
         onClose={closeProduct}
         title={productDrawer.item ? 'Editar produto' : 'Novo produto'}
         width={isMobile ? '100%' : 520}
+        destroyOnClose
         footer={
           <Space style={{ justifyContent: 'flex-end', width: '100%' }}>
             <Button onClick={closeProduct}>Cancelar</Button>
-            <Button type="primary" onClick={() => productForm.submit()}>Salvar</Button>
+            <Button type="primary" onClick={() => productForm.submit()} loading={submitting} disabled={submitting}>Salvar</Button>
           </Space>
         }
       >
@@ -4353,7 +4473,7 @@ function AppContent() {
             <Input.TextArea rows={2} />
           </Form.Item>
 
-          <Button type="primary" htmlType="submit" block>
+          <Button type="primary" htmlType="submit" block loading={submitting} disabled={submitting}>
             Confirmar
           </Button>
         </Form>
@@ -4366,10 +4486,11 @@ function AppContent() {
         onClose={closeBasket}
         title={basketDrawer.item ? 'Editar cesta' : 'Nova cesta básica'}
         width={isMobile ? '100%' : 580}
+        destroyOnClose
         footer={
           <Space style={{ justifyContent: 'flex-end', width: '100%' }}>
             <Button onClick={closeBasket}>Cancelar</Button>
-            <Button type="primary" onClick={() => basketForm.submit()}>Salvar</Button>
+            <Button type="primary" onClick={() => basketForm.submit()} loading={submitting} disabled={submitting}>Salvar</Button>
           </Space>
         }
       >
@@ -4525,7 +4646,7 @@ function AppContent() {
             <Input.TextArea rows={2} />
           </Form.Item>
 
-          <Button type="primary" htmlType="submit" block>Confirmar</Button>
+          <Button type="primary" htmlType="submit" block loading={submitting} disabled={submitting}>Confirmar</Button>
         </Form>
       </Modal>
 
@@ -4580,7 +4701,7 @@ function AppContent() {
             <Input.TextArea rows={2} />
           </Form.Item>
 
-          <Button type="primary" htmlType="submit" block>Confirmar ajuste</Button>
+          <Button type="primary" htmlType="submit" block loading={submitting} disabled={submitting}>Confirmar ajuste</Button>
         </Form>
       </Modal>
 
@@ -4643,7 +4764,7 @@ function AppContent() {
             <Input.TextArea rows={2} />
           </Form.Item>
 
-          <Button type="primary" htmlType="submit" block>Salvar alterações</Button>
+          <Button type="primary" htmlType="submit" block loading={submitting} disabled={submitting}>Salvar alterações</Button>
         </Form>
       </Modal>
 
@@ -4688,10 +4809,11 @@ function AppContent() {
         onClose={() => { setSpcDrawer({ open: false, item: null }); spcForm.resetFields(); }}
         title={spcDrawer.item ? 'Editar registro SPC' : 'Incluir cliente no SPC'}
         width={isMobile ? '100%' : 500}
+        destroyOnClose
         footer={
           <Space style={{ justifyContent: 'flex-end', width: '100%' }}>
             <Button onClick={() => { setSpcDrawer({ open: false, item: null }); spcForm.resetFields(); }}>Cancelar</Button>
-            <Button type="primary" danger onClick={() => spcForm.submit()}>Salvar</Button>
+            <Button type="primary" danger onClick={() => spcForm.submit()} loading={submitting} disabled={submitting}>Salvar</Button>
           </Space>
         }
       >
@@ -4775,7 +4897,7 @@ function AppContent() {
           <Form.Item name="notes" label="Observações">
             <Input.TextArea rows={2} />
           </Form.Item>
-          <Button type="primary" htmlType="submit" block style={{ background: 'var(--green-500)', borderColor: 'var(--green-500)' }}>
+          <Button type="primary" htmlType="submit" block loading={submitting} disabled={submitting} style={{ background: 'var(--green-500)', borderColor: 'var(--green-500)' }}>
             Confirmar baixa
           </Button>
         </Form>
@@ -4809,7 +4931,7 @@ function AppContent() {
           <Form.Item name="notes" label="Observações">
             <Input.TextArea rows={2} />
           </Form.Item>
-          <Button type="primary" htmlType="submit" block style={{ background: 'var(--amber-500)', borderColor: 'var(--amber-500)' }}>
+          <Button type="primary" htmlType="submit" block loading={submitting} disabled={submitting} style={{ background: 'var(--amber-500)', borderColor: 'var(--amber-500)' }}>
             Registrar acordo
           </Button>
         </Form>

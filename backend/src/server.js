@@ -2907,6 +2907,9 @@ app.post('/baskets/movements', auth(['ADMIN']), async (req, res) => {
     });
     if (!basket) return res.status(404).json({ message: 'Cesta não encontrada.' });
 
+    const requestingUser = await prisma.user.findUnique({ where: { id: req.user.sub } });
+    if (!requestingUser) return res.status(401).json({ message: 'Usuário não encontrado.' });
+
     // Validações de estoque
     if (data.type === 'MONTAGEM') {
       // Verificar se há produtos suficientes para montar N cestas
