@@ -12,6 +12,7 @@ Sistema de controle de clientes, contratos, cobrança, estoque e SPC.
 | Autenticação | JWT armazenado em cookie HttpOnly |
 | Processo (produção) | PM2 |
 | Proxy reverso | nginx (porta 8080 → backend 3001) |
+| Hospedagem | Contabo VPS (Ubuntu) |
 | Deploy alternativo | Railway |
 
 ## Perfis de acesso
@@ -92,7 +93,7 @@ npm install
 npm run dev        # http://localhost:5173
 ```
 
-## Deploy em VPS (Ubuntu + nginx + PM2)
+## Deploy na Contabo VPS (Ubuntu + nginx + PM2)
 
 ### 1. Pré-requisitos
 
