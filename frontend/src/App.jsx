@@ -470,7 +470,6 @@ function AppContent() {
   const screens = useBreakpoint();
   const isMobile = !screens.lg;
 
-  const [token, setToken] = useState(localStorage.getItem('token') || '');
   const [user, setUser] = useState(() => {
     try { return JSON.parse(localStorage.getItem('user') || 'null'); }
     catch { return null; }
@@ -478,6 +477,17 @@ function AppContent() {
   const [current, setCurrent] = useState('dashboard');
   const [loading, setLoading] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  // Verifica na montagem se o cookie de sessão ainda é válido
+  useEffect(() => {
+    const stored = localStorage.getItem('user');
+    if (!stored) return;
+    api.get('/auth/me').catch(() => {
+      localStorage.removeItem('user');
+      setUser(null);
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const [summary, setSummary] = useState({
     valueOpenMonth: 0,
@@ -657,7 +667,7 @@ function AppContent() {
   const loadingRef = React.useRef(false);
 
   const loadAll = useCallback(async () => {
-    if (!token) return;
+    if (!user) return;
     if (loadingRef.current) return;
     loadingRef.current = true;
 
@@ -699,17 +709,20 @@ function AppContent() {
 
       let idx = 0;
       setSummary(responses[idx++].data);
-      setCustomers(responses[idx++].data || []);
-      setContracts(responses[idx++].data || []);
+      const customersRes = responses[idx++].data;
+      setCustomers(Array.isArray(customersRes) ? customersRes : (customersRes?.data || []));
+      const contractsRes = responses[idx++].data;
+      setContracts(Array.isArray(contractsRes) ? contractsRes : (contractsRes?.data || []));
 
-      setPayments(responses[idx++].data || []);
+      const paymentsRes = responses[idx++].data;
+      setPayments(Array.isArray(paymentsRes) ? paymentsRes : (paymentsRes?.data || []));
 
       if (isAdmin) {
         setCollectors(responses[idx++].data || []);
         setUsers(responses[idx++].data || []);
         setDistributionCollectors(responses[idx++].data || []);
         setAvailableContracts(responses[idx++].data || []);
-        setAuditLogs(responses[idx++].data || []);
+        setAuditLogs(responses[idx++].data?.data || []);
         // Produtos e cestas carregados separadamente
         try {
           const prodRes = await api.get('/products');
@@ -725,7 +738,7 @@ function AppContent() {
         }
         try {
           const [spcRes, spcSumRes] = await Promise.all([api.get('/spc'), api.get('/spc/summary')]);
-          setSpcRecords(spcRes.data || []);
+          setSpcRecords(spcRes.data?.data || []);
           setSpcSummary(spcSumRes.data);
         } catch { setSpcRecords([]); }
       } else {
@@ -742,7 +755,7 @@ function AppContent() {
       setLoading(false);
       loadingRef.current = false;
     }
-  }, [token, isAdmin, isCollector]);
+  }, [user?.id, isAdmin, isCollector]);
 
   useEffect(() => {
     loadAll();
@@ -798,10 +811,8 @@ function AppContent() {
     });
   }, [payments, debouncedPaymentSearch, paymentDateRange]);
 
-  function persistAuth(nextToken, nextUser) {
-    localStorage.setItem('token', nextToken);
+  function persistAuth(nextUser) {
     localStorage.setItem('user', JSON.stringify(nextUser));
-    setToken(nextToken);
     setUser(nextUser);
   }
 
@@ -809,7 +820,7 @@ function AppContent() {
     try {
       setLoading(true);
       const { data } = await api.post('/auth/login', values);
-      persistAuth(data.token, data.user);
+      persistAuth(data.user);
       setCurrent(data.user.role === 'COLLECTOR' ? 'cobranca' : 'dashboard');
       ant.message.success(`Bem-vindo, ${data.user.name}`);
     } catch (error) {
@@ -819,10 +830,9 @@ function AppContent() {
     }
   }
 
-  function logout() {
-    localStorage.removeItem('token');
+  async function logout() {
+    try { await api.post('/auth/logout'); } catch { /* ignora */ }
     localStorage.removeItem('user');
-    setToken('');
     setUser(null);
     setCurrent('dashboard');
     setMobileMenuOpen(false);
@@ -1327,7 +1337,7 @@ function AppContent() {
     try {
       setSpcLoading(true);
       const [recRes, sumRes] = await Promise.all([api.get('/spc'), api.get('/spc/summary')]);
-      setSpcRecords(recRes.data || []);
+      setSpcRecords(recRes.data?.data || []);
       setSpcSummary(sumRes.data);
     } catch (e) {
       ant.message.error('Erro ao carregar SPC.');
@@ -1872,7 +1882,7 @@ function AppContent() {
     </div>
   );
 
-  if (!token || !user) return loginScreen;
+  if (!user) return loginScreen;
 
   const customerColumns = [
     {
@@ -3517,9 +3527,9 @@ function AppContent() {
       <Card bordered={false} title={
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <span style={{ fontWeight: 600 }}>Registros no SPC</span>
-          <Tag color="red">{spcRecords.filter(r => r.status === 'ATIVO').length} ativos</Tag>
-          <Tag color="orange">{spcRecords.filter(r => r.status === 'ACORDO').length} em acordo</Tag>
-          <Tag color="green">{spcRecords.filter(r => r.status === 'BAIXADO').length} baixados</Tag>
+          <Tag color="red">{spcSummary?.totalAtivos ?? spcRecords.filter(r => r.status === 'ATIVO').length} ativos</Tag>
+          <Tag color="orange">{spcSummary?.totalAcordos ?? spcRecords.filter(r => r.status === 'ACORDO').length} em acordo</Tag>
+          <Tag color="green">{spcSummary?.totalBaixadosMes ?? spcRecords.filter(r => r.status === 'BAIXADO').length} baixados este mês</Tag>
         </div>
       }>
         <Table

@@ -1,28 +1,109 @@
 require('dotenv').config();
+const { Prisma } = require('@prisma/client');
+
+// ── Validação de variáveis de ambiente obrigatórias ──────────────
+const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET'];
+const missingEnv = REQUIRED_ENV.filter((k) => !process.env[k]);
+if (missingEnv.length) {
+  console.error(`ERRO: Variáveis de ambiente obrigatórias ausentes: ${missingEnv.join(', ')}`);
+  process.exit(1);
+}
+
 const express = require('express');
 const cors = require('cors');
+const cookieParser = require('cookie-parser');
+const rateLimit = require('express-rate-limit');
 const morgan = require('morgan');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { z } = require('zod');
 const PDFDocument = require('pdfkit');
 const ExcelJS = require('exceljs');
+const { randomUUID } = require('crypto');
 const prisma = require('./utils/prisma');
 const auth = require('./middleware/auth');
 const { startOfMonth, endOfMonth, startOfDay, endOfDay } = require('./utils/date');
-
-// Parse de data: salva como meia-noite UTC pura
-// O front lê as datas em UTC (dayjs.utc) então o dia nunca recua
-function parseDate(str) {
-  if (!str) return null;
-  const dateOnly = str.split('T')[0]; // garante só YYYY-MM-DD
-  return new Date(dateOnly + 'T00:00:00.000Z');
-}
+const {
+  parseDate,
+  isValidCpf,
+  safeErrorMessage,
+  calcContractTotal,
+  normalizeInstallmentStatus,
+  normalizeContractStatus,
+  buildInstallments,
+  toCsv,
+  moneyLike,
+  getErrorStatus
+} = require('./utils/business');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// ── CORS ────────────────────────────────────────────────────────
+const DEV_ORIGINS = ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:3000'];
+const allowedOrigins = process.env.FRONTEND_URL
+  ? process.env.FRONTEND_URL.split(',').map((o) => o.trim())
+  : DEV_ORIGINS;
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Requisições sem origin (curl, proxy nginx mesmo-domínio) são sempre permitidas
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      callback(new Error(`Origem não permitida pelo CORS: ${origin}`));
+    },
+    credentials: true
+  })
+);
+
+// ── Rate limiting ────────────────────────────────────────────────
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Muitas tentativas. Tente novamente em 15 minutos.' }
+});
+
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minuto
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Limite de requisições atingido. Tente novamente em instantes.' }
+});
+
+// Limiter para escrita — endpoints que criam/editam dados financeiros
+const writeLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minuto
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Muitas operações em pouco tempo. Aguarde um momento.' }
+});
+
+app.use(globalLimiter);
+// Aplica writeLimiter em todas as rotas de escrita (POST, PUT, DELETE, PATCH)
+app.use((req, res, next) => {
+  if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method)) {
+    return writeLimiter(req, res, next);
+  }
+  next();
+});
+app.use(express.json({ limit: '1mb' }));
+app.use(cookieParser());
 app.use(morgan('dev'));
+
+// ── Request ID — correlação de logs ─────────────────────────────
+app.use((req, res, next) => {
+  req.requestId = randomUUID();
+  res.setHeader('X-Request-Id', req.requestId);
+  next();
+});
+
+// Hash válido gerado uma vez no startup para evitar timing attack no login.
+// bcrypt.hashSync garante que compare() leve o mesmo tempo mesmo quando usuário não existe.
+const DUMMY_HASH = bcrypt.hashSync('__timing_protection_dummy__', 10);
 
 // ── Helper PDF: desenha tabela com paginação automática ──────────
 function pdfDrawTable(doc, headers, rows, colWidths, options = {}) {
@@ -66,13 +147,7 @@ function pdfDrawTable(doc, headers, rows, colWidths, options = {}) {
   doc.y = curY + 4;
 }
 
-const cpfRegex = /^\d{11}$/;
 const brPhoneRegex = /^\d{10,11}$/;
-
-function calcContractTotal(contract) {
-  const interestFactor = 1 + Number(contract.interestRate || 0) / 100;
-  return Number((Number(contract.financedAmount || 0) * interestFactor).toFixed(2));
-}
 
 function signUser(user) {
   return jwt.sign(
@@ -82,51 +157,13 @@ function signUser(user) {
   );
 }
 
-function normalizeInstallmentStatus(installment) {
-  const today = new Date();
-  const fullyPaid = Number(installment.paidAmount || 0) >= Number(installment.amount || 0);
-
-  if (fullyPaid) return 'PAGA';
-  if (Number(installment.paidAmount || 0) > 0) return 'PARCIAL';
-  if (new Date(installment.dueDate) < today) return 'ATRASADA';
-  return 'PENDENTE';
-}
-
-function normalizeContractStatus(contractLike) {
-  const installments = contractLike.installments || [];
-  if (!installments.length) return 'ATIVO';
-
-  const allPaid = installments.every(
-    (i) => Number(i.paidAmount || 0) >= Number(i.amount || 0)
-  );
-  if (allPaid) return 'QUITADO';
-
-  const anyOverdue = installments.some((i) => normalizeInstallmentStatus(i) === 'ATRASADA');
-  if (anyOverdue) return 'ATRASADO';
-
-  return 'ATIVO';
-}
-
-function buildInstallments(contractStartDate, installmentCount, totalValue) {
-  const amount = Number((totalValue / installmentCount).toFixed(2));
-  const installments = [];
-
-  for (let i = 1; i <= installmentCount; i += 1) {
-    const dueDate = new Date(contractStartDate);
-    // Parcela 1 = 30 dias após início, parcela 2 = 60 dias, etc.
-    dueDate.setMonth(dueDate.getMonth() + i);
-
-    installments.push({
-      number: i,
-      dueDate,
-      amount:
-        i === installmentCount
-          ? Number((totalValue - amount * (installmentCount - 1)).toFixed(2))
-          : amount
-    });
-  }
-
-  return installments;
+function setAuthCookie(res, token) {
+  res.cookie('authToken', token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 7 * 24 * 60 * 60 * 1000 // 7 dias
+  });
 }
 
 async function writeAuditLog({
@@ -184,26 +221,9 @@ async function enrichContract(contract) {
   };
 }
 
-function toCsv(rows) {
-  if (!rows.length) return '';
-  const headers = Object.keys(rows[0]);
-  const escapeCell = (value) => {
-    const stringValue = value == null ? '' : String(value);
-    return `"${stringValue.replace(/"/g, '""')}"`;
-  };
-  return [
-    headers.join(','),
-    ...rows.map((row) => headers.map((header) => escapeCell(row[header])).join(','))
-  ].join('\n');
-}
-
-function moneyLike(value) {
-  return Number(value || 0).toFixed(2);
-}
-
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-app.post('/auth/setup-admin', async (req, res) => {
+app.post('/auth/setup-admin', authLimiter, async (req, res) => {
   try {
     const key = req.headers['x-setup-key'];
     if (key !== process.env.SETUP_ADMIN_KEY) {
@@ -211,9 +231,9 @@ app.post('/auth/setup-admin', async (req, res) => {
     }
 
     const schema = z.object({
-      name: z.string().min(3),
-      email: z.string().email(),
-      password: z.string().min(6)
+      name: z.string().min(3).max(255),
+      email: z.string().email().max(255),
+      password: z.string().min(6).max(100)
     });
 
     const data = schema.parse(req.body);
@@ -246,47 +266,56 @@ app.post('/auth/setup-admin', async (req, res) => {
     });
 
     const token = signUser(user);
+    setAuthCookie(res, token);
     res.json({
       ok: true,
-      token,
       user: { id: user.id, name: user.name, email: user.email, role: user.role }
     });
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao criar administrador.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao criar administrador.') });
   }
 });
 
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', authLimiter, async (req, res) => {
   try {
     const schema = z.object({
-      email: z.string().email(),
-      password: z.string().min(6)
+      email: z.string().email().max(255),
+      password: z.string().min(6).max(100)
     });
     const data = schema.parse(req.body);
 
     const user = await prisma.user.findUnique({ where: { email: data.email } });
-    if (!user || !user.isActive) {
-      return res.status(401).json({ message: 'Usuário ou senha inválidos.' });
-    }
 
-    const valid = await bcrypt.compare(data.password, user.passwordHash);
-    if (!valid) {
+    // Sempre executa bcrypt.compare para evitar timing attack (enumeração de usuários)
+    const hashToCompare = (user && user.isActive) ? user.passwordHash : DUMMY_HASH;
+    const valid = await bcrypt.compare(data.password, hashToCompare);
+
+    if (!user || !user.isActive || !valid) {
       return res.status(401).json({ message: 'Usuário ou senha inválidos.' });
     }
 
     const token = signUser(user);
+    setAuthCookie(res, token);
+
     res.json({
-      token,
       user: { id: user.id, name: user.name, email: user.email, role: user.role }
     });
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao efetuar login.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao efetuar login.') });
   }
+});
+
+app.post('/auth/logout', (_req, res) => {
+  res.clearCookie('authToken', { httpOnly: true, sameSite: 'lax', secure: false });
+  res.json({ ok: true });
 });
 
 app.get('/auth/me', auth(), async (req, res) => {
   const user = await prisma.user.findUnique({ where: { id: req.user.sub } });
-  if (!user) return res.status(404).json({ message: 'Usuário não encontrado.' });
+  if (!user || !user.isActive) {
+    res.clearCookie('authToken', { httpOnly: true, sameSite: 'lax', secure: false });
+    return res.status(401).json({ message: 'Sessão inválida.' });
+  }
   res.json({ id: user.id, name: user.name, email: user.email, role: user.role });
 });
 
@@ -317,9 +346,9 @@ app.get('/collectors', auth(['ADMIN']), async (_req, res) => {
 app.post('/users', auth(['ADMIN']), async (req, res) => {
   try {
     const schema = z.object({
-      name: z.string().min(3),
-      email: z.string().email(),
-      password: z.string().min(6),
+      name: z.string().min(3).max(255),
+      email: z.string().email().max(255),
+      password: z.string().min(6).max(100),
       role: z.enum(['ADMIN', 'COLLECTOR']),
       isActive: z.boolean().optional().default(true)
     });
@@ -348,18 +377,18 @@ app.post('/users', auth(['ADMIN']), async (req, res) => {
 
     res.status(201).json(user);
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao criar usuário.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao criar usuário.') });
   }
 });
 
 app.put('/users/:id', auth(['ADMIN']), async (req, res) => {
   try {
     const schema = z.object({
-      name: z.string().min(3),
-      email: z.string().email(),
+      name: z.string().min(3).max(255),
+      email: z.string().email().max(255),
       role: z.enum(['ADMIN', 'COLLECTOR']),
       isActive: z.boolean(),
-      password: z.string().min(6).optional().or(z.literal(''))
+      password: z.string().min(6).max(100).optional().or(z.literal(''))
     });
 
     const data = schema.parse(req.body);
@@ -390,12 +419,16 @@ app.put('/users/:id', auth(['ADMIN']), async (req, res) => {
 
     res.json(user);
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao atualizar usuário.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao atualizar usuário.') });
   }
 });
 
 app.delete('/users/:id', auth(['ADMIN']), async (req, res) => {
   try {
+    if (req.params.id === req.user.sub) {
+      return res.status(400).json({ message: 'Não é possível excluir sua própria conta.' });
+    }
+
     await prisma.user.delete({ where: { id: req.params.id } });
 
     await writeAuditLog({
@@ -408,36 +441,40 @@ app.delete('/users/:id', auth(['ADMIN']), async (req, res) => {
 
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao excluir usuário.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao excluir usuário.') });
   }
 });
 
 app.get('/customers', auth(), async (req, res) => {
-  const q = req.query.q?.toString() || '';
+  const q = (req.query.q?.toString() || '').slice(0, 100);
   const status = req.query.status?.toString() || '';
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
+  const skip = (page - 1) * limit;
 
+  const cpfQ = q.replace(/\D/g, '');
   const where = {
     ...(status ? { status } : {}),
     ...(q
       ? {
           OR: [
-            { name: { contains: q } },
-            { cpf: { contains: q } },
+            { name: { contains: q, mode: 'insensitive' } },
+            ...(cpfQ ? [{ cpf: { contains: cpfQ } }] : []),
             { phone1: { contains: q } },
             { phone2: { contains: q } },
-            { city: { contains: q } },
-            { neighborhood: { contains: q } }
+            { city: { contains: q, mode: 'insensitive' } },
+            { neighborhood: { contains: q, mode: 'insensitive' } }
           ]
         }
       : {}),
   };
 
-  const customers = await prisma.customer.findMany({
-    where,
-    orderBy: { createdAt: 'desc' }
-  });
+  const [customers, total] = await Promise.all([
+    prisma.customer.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take: limit }),
+    prisma.customer.count({ where })
+  ]);
 
-  res.json(customers);
+  res.json({ data: customers, total, page, limit, pages: Math.ceil(total / limit) });
 });
 
 app.get('/customers/:id/full', auth(), async (req, res) => {
@@ -511,29 +548,32 @@ app.get('/customers/:id/full', auth(), async (req, res) => {
       timeline
     });
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao carregar ficha do cliente.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao carregar ficha do cliente.') });
   }
 });
 
 app.post('/customers', auth(['ADMIN']), async (req, res) => {
   try {
     const schema = z.object({
-      cpf: z.string().regex(cpfRegex, 'CPF deve conter 11 dígitos.'),
-      name: z.string().min(3),
+      cpf: z.string().refine(isValidCpf, 'CPF inválido.'),
+      name: z.string().min(3).max(255),
       zipCode: z.string().optional().nullable(),
-      street: z.string().min(3),
-      number: z.string().min(1),
-      complement: z.string().optional().nullable(),
-      neighborhood: z.string().min(2),
-      city: z.string().min(2),
+      street: z.string().min(3).max(255),
+      number: z.string().min(1).max(100),
+      complement: z.string().max(2000).optional().nullable(),
+      neighborhood: z.string().min(2).max(100),
+      city: z.string().min(2).max(100),
       state: z.string().min(2).max(2),
-      birthDate: z.string(),
+      birthDate: z.string().refine((d) => {
+        const age = Math.floor((Date.now() - new Date(d).getTime()) / (365.25 * 24 * 3600 * 1000));
+        return age >= 18 && age <= 120;
+      }, 'Data de nascimento inválida (idade deve ser entre 18 e 120 anos).'),
       phone1: z.string().regex(brPhoneRegex),
       phone2: z.string().regex(brPhoneRegex).optional().or(z.literal('')).nullable(),
-      monthlyIncome: z.coerce.number().min(0),
-      residenceMonths: z.coerce.number().int().min(0),
+      monthlyIncome: z.coerce.number().min(0).max(9_999_999),
+      residenceMonths: z.coerce.number().int().min(0).max(1200),
       status: z.enum(['ATIVO', 'BLOQUEADO', 'INADIMPLENTE']).optional().default('ATIVO'),
-      notes: z.string().optional().nullable()
+      notes: z.string().max(2000).optional().nullable()
     });
 
     const data = schema.parse(req.body);
@@ -570,7 +610,7 @@ app.post('/customers', auth(['ADMIN']), async (req, res) => {
 
     res.status(201).json(customer);
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao criar cliente.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao criar cliente.') });
   }
 });
 
@@ -581,22 +621,25 @@ app.put('/customers/:id', auth(['ADMIN']), async (req, res) => {
 
 
     const schema = z.object({
-      cpf: z.string().regex(cpfRegex),
-      name: z.string().min(3),
+      cpf: z.string().refine(isValidCpf, 'CPF inválido.'),
+      name: z.string().min(3).max(255),
       zipCode: z.string().optional().nullable(),
-      street: z.string().min(3),
-      number: z.string().min(1),
-      complement: z.string().optional().nullable(),
-      neighborhood: z.string().min(2),
-      city: z.string().min(2),
+      street: z.string().min(3).max(255),
+      number: z.string().min(1).max(100),
+      complement: z.string().max(2000).optional().nullable(),
+      neighborhood: z.string().min(2).max(100),
+      city: z.string().min(2).max(100),
       state: z.string().min(2).max(2),
-      birthDate: z.string(),
+      birthDate: z.string().refine((d) => {
+        const age = Math.floor((Date.now() - new Date(d).getTime()) / (365.25 * 24 * 3600 * 1000));
+        return age >= 18 && age <= 120;
+      }, 'Data de nascimento inválida (idade deve ser entre 18 e 120 anos).'),
       phone1: z.string().regex(brPhoneRegex),
       phone2: z.string().regex(brPhoneRegex).optional().or(z.literal('')).nullable(),
-      monthlyIncome: z.coerce.number().min(0),
-      residenceMonths: z.coerce.number().int().min(0),
+      monthlyIncome: z.coerce.number().min(0).max(9_999_999),
+      residenceMonths: z.coerce.number().int().min(0).max(1200),
       status: z.enum(['ATIVO', 'BLOQUEADO', 'INADIMPLENTE']),
-      notes: z.string().optional().nullable()
+      notes: z.string().max(2000).optional().nullable()
     });
 
     const data = schema.parse(req.body);
@@ -634,12 +677,31 @@ app.put('/customers/:id', auth(['ADMIN']), async (req, res) => {
 
     res.json(customer);
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao atualizar cliente.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao atualizar cliente.') });
   }
 });
 
 app.delete('/customers/:id', auth(['ADMIN']), async (req, res) => {
   try {
+    const customer = await prisma.customer.findUnique({
+      where: { id: req.params.id },
+      include: {
+        contracts: {
+          include: { payments: { take: 1 } },
+          take: 1
+        }
+      }
+    });
+
+    if (!customer) return res.status(404).json({ message: 'Cliente não encontrado.' });
+
+    const hasPayments = customer.contracts.some((c) => c.payments.length > 0);
+    if (hasPayments) {
+      return res.status(400).json({
+        message: 'Não é possível excluir este cliente pois possui histórico de pagamentos. Utilize o status BLOQUEADO para inativar o cliente.'
+      });
+    }
+
     await prisma.customer.delete({ where: { id: req.params.id } });
 
     await writeAuditLog({
@@ -647,12 +709,12 @@ app.delete('/customers/:id', auth(['ADMIN']), async (req, res) => {
       action: 'DELETE',
       entityType: 'CUSTOMER',
       entityId: req.params.id,
-      description: 'Cliente excluído.'
+      description: `Cliente ${customer.name} (CPF: ${customer.cpf}) excluído.`
     });
 
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao excluir cliente.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao excluir cliente.') });
   }
 });
 
@@ -739,79 +801,88 @@ app.get('/collector/dashboard', auth(['COLLECTOR']), async (req, res) => {
 
     res.json(result);
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao carregar dados do cobrador.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao carregar dados do cobrador.') });
   }
 });
 
 app.get('/contracts', auth(), async (req, res) => {
-  const q = req.query.q?.toString() || '';
+  const q = (req.query.q?.toString() || '').slice(0, 100);
   const status = req.query.status?.toString() || '';
   const overdueOnly = req.query.overdue === 'true';
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+  const skip = (page - 1) * limit;
 
   const where = {
     ...(status ? { status } : {}),
     ...(q
       ? {
           OR: [
-            { product: { contains: q } },
-            { customer: { name: { contains: q } } },
-            { customer: { cpf: { contains: q } } }
+            { product: { contains: q, mode: 'insensitive' } },
+            { customer: { name: { contains: q, mode: 'insensitive' } } },
+            ...(q.replace(/\D/g, '') ? [{ customer: { cpf: { contains: q.replace(/\D/g, '') } } }] : [])
           ]
         }
       : {}),
     ...(req.user.role === 'COLLECTOR'
+      ? { assignments: { some: { collectorId: req.user.sub } } }
+      : {}),
+    // Pré-filtro para overdueOnly: traz contratos com pelo menos uma parcela vencida.
+    // Não filtra por paidAmount aqui porque Prisma não suporta comparação entre colunas
+    // (paidAmount < amount). O filtro preciso (overdueInstallments > 0) roda após enrichContract.
+    ...(overdueOnly
       ? {
-          assignments: {
-            some: {
-              collectorId: req.user.sub
-            }
+          installments: {
+            some: { dueDate: { lt: new Date() } }
           }
         }
-      : {}),
-    
+      : {})
   };
 
-  const rawContracts = await prisma.contract.findMany({
-    where,
-    include: {
-      customer: true,
-      installments: { orderBy: { number: 'asc' } },
-      payments: {
-        include: {
-          installment: true,
-          collector: { select: { id: true, name: true, email: true } }
+  const [rawContracts, total] = await Promise.all([
+    prisma.contract.findMany({
+      where,
+      include: {
+        customer: true,
+        installments: { orderBy: { number: 'asc' } },
+        payments: {
+          include: {
+            installment: true,
+            collector: { select: { id: true, name: true, email: true } }
+          }
+        },
+        assignments: {
+          include: { collector: { select: { id: true, name: true, email: true } } }
         }
       },
-      assignments: {
-        include: {
-          collector: { select: { id: true, name: true, email: true } }
-        }
-      }
-    },
-    orderBy: { createdAt: 'desc' }
-  });
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit
+    }),
+    prisma.contract.count({ where })
+  ]);
 
   const contracts = await Promise.all(rawContracts.map(enrichContract));
   const filtered = overdueOnly ? contracts.filter((c) => c.overdueInstallments > 0) : contracts;
 
-  res.json(filtered);
+  res.json({ data: filtered, total, page, limit, pages: Math.ceil(total / limit) });
 });
 
 app.post('/contracts', auth(['ADMIN']), async (req, res) => {
   try {
     const schema = z.object({
-      customerId: z.string().min(1),
-      product: z.string().min(2),
-      quantity: z.coerce.number().int().min(1).default(1),
-      financedAmount: z.coerce.number().positive(),
-      installmentCount: z.coerce.number().int().positive(),
+      customerId: z.string().min(1).max(100),
+      product: z.string().min(2).max(100),
+      quantity: z.coerce.number().int().min(1).max(10000).default(1),
+      financedAmount: z.coerce.number().positive().max(9_999_999),
+      installmentCount: z.coerce.number().int().min(1).max(360),
       contractStartDate: z.string(),
-      interestRate: z.coerce.number().min(0),
-      notes: z.string().optional().nullable(),
+      interestRate: z.coerce.number().min(0).max(100),
+      notes: z.string().max(2000).optional().nullable(),
       status: z.enum(['ATIVO', 'QUITADO', 'ATRASADO', 'RENEGOCIADO']).optional().default('ATIVO'),
       promisedPaymentDate: z.string().optional().nullable(),
-      promisedPaymentValue: z.coerce.number().optional().nullable(),
-      collectionNote: z.string().optional().nullable()
+      promisedPaymentValue: z.coerce.number().min(0).max(9_999_999).optional().nullable(),
+      collectionNote: z.string().max(2000).optional().nullable()
     });
 
     const data = schema.parse(req.body);
@@ -868,7 +939,7 @@ app.post('/contracts', auth(['ADMIN']), async (req, res) => {
       });
 
       if (basket) {
-        // Baixa no estoque de cestas
+        // Baixa no estoque de cestas — transação garante movement + stock atomicamente
         if (basket.currentStock >= data.quantity) {
           const basketSalePricePerUnit = data.quantity > 0
             ? Number((data.financedAmount / data.quantity).toFixed(2))
@@ -877,25 +948,27 @@ app.post('/contracts', auth(['ADMIN']), async (req, res) => {
             ? Number((((basketSalePricePerUnit - basket.costPrice) / basketSalePricePerUnit) * 100).toFixed(2))
             : null;
 
-          await prisma.basketMovement.create({
-            data: {
-              basketId: basket.id,
-              type: 'VENDA',
-              quantity: data.quantity,
-              unitCost: basket.costPrice,
-              salePrice: basketSalePricePerUnit,
-              margin: basketMargin,
-              destination,
-              contractId: contract.id,
-              customerId: data.customerId,
-              notes: `Contrato ID ${contract.id} · Total: R$ ${data.financedAmount.toFixed(2)} · ${data.quantity} un`,
-              userId: req.user.sub
-            }
-          });
-          await prisma.basket.update({
-            where: { id: basket.id },
-            data: { currentStock: { increment: -data.quantity } }
-          });
+          await prisma.$transaction([
+            prisma.basketMovement.create({
+              data: {
+                basketId: basket.id,
+                type: 'VENDA',
+                quantity: data.quantity,
+                unitCost: basket.costPrice,
+                salePrice: basketSalePricePerUnit,
+                margin: basketMargin,
+                destination,
+                contractId: contract.id,
+                customerId: data.customerId,
+                notes: `Contrato ID ${contract.id} · Total: R$ ${data.financedAmount.toFixed(2)} · ${data.quantity} un`,
+                userId: req.user.sub
+              }
+            }),
+            prisma.basket.update({
+              where: { id: basket.id },
+              data: { currentStock: { increment: -data.quantity } }
+            })
+          ]);
         }
       } else {
         // Verificar se é um produto do estoque
@@ -904,35 +977,34 @@ app.post('/contracts', auth(['ADMIN']), async (req, res) => {
         });
 
         if (product && product.currentStock >= data.quantity) {
-          // Preço de venda por unidade = valor total / quantidade de unidades
           const salePricePerUnit = data.quantity > 0
             ? Number((data.financedAmount / data.quantity).toFixed(2))
             : data.financedAmount;
-
-          // Margem calculada por unidade: (venda/un - custo/un) / venda/un
           const margin = product.costPrice > 0 && salePricePerUnit > 0
             ? Number((((salePricePerUnit - product.costPrice) / salePricePerUnit) * 100).toFixed(2))
             : null;
 
-          await prisma.stockMovement.create({
-            data: {
-              productId: product.id,
-              type: 'SAIDA',
-              quantity: data.quantity,
-              unitCost: product.costPrice,       // custo por unidade
-              salePrice: salePricePerUnit,        // venda por unidade
-              margin,
-              destination,
-              contractId: contract.id,
-              customerId: data.customerId,
-              notes: `Contrato ID ${contract.id} · Total: R$ ${data.financedAmount.toFixed(2)} · ${data.quantity} ${product.unit}`,
-              userId: req.user.sub
-            }
-          });
-          await prisma.product.update({
-            where: { id: product.id },
-            data: { currentStock: { increment: -data.quantity }, updatedAt: new Date() }
-          });
+          await prisma.$transaction([
+            prisma.stockMovement.create({
+              data: {
+                productId: product.id,
+                type: 'SAIDA',
+                quantity: data.quantity,
+                unitCost: product.costPrice,
+                salePrice: salePricePerUnit,
+                margin,
+                destination,
+                contractId: contract.id,
+                customerId: data.customerId,
+                notes: `Contrato ID ${contract.id} · Total: R$ ${data.financedAmount.toFixed(2)} · ${data.quantity} ${product.unit}`,
+                userId: req.user.sub
+              }
+            }),
+            prisma.product.update({
+              where: { id: product.id },
+              data: { currentStock: { increment: -data.quantity }, updatedAt: new Date() }
+            })
+          ]);
         }
       }
     } catch (stockError) {
@@ -942,7 +1014,7 @@ app.post('/contracts', auth(['ADMIN']), async (req, res) => {
 
     res.status(201).json(await enrichContract(contract));
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao criar contrato.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao criar contrato.') });
   }
 });
 
@@ -957,17 +1029,17 @@ app.put('/contracts/:id', auth(['ADMIN']), async (req, res) => {
 
 
     const schema = z.object({
-      customerId: z.string().min(1),
-      product: z.string().min(2),
-      financedAmount: z.coerce.number().positive(),
-      installmentCount: z.coerce.number().int().positive(),
+      customerId: z.string().min(1).max(100),
+      product: z.string().min(2).max(100),
+      financedAmount: z.coerce.number().positive().max(9_999_999),
+      installmentCount: z.coerce.number().int().min(1).max(360),
       contractStartDate: z.string(),
-      interestRate: z.coerce.number().min(0),
-      notes: z.string().optional().nullable(),
+      interestRate: z.coerce.number().min(0).max(100),
+      notes: z.string().max(2000).optional().nullable(),
       status: z.enum(['ATIVO', 'QUITADO', 'ATRASADO', 'RENEGOCIADO']).optional().default('ATIVO'),
       promisedPaymentDate: z.string().optional().nullable(),
-      promisedPaymentValue: z.coerce.number().optional().nullable(),
-      collectionNote: z.string().optional().nullable()
+      promisedPaymentValue: z.coerce.number().min(0).max(9_999_999).optional().nullable(),
+      collectionNote: z.string().max(2000).optional().nullable()
     });
 
     const data = schema.parse(req.body);
@@ -1007,7 +1079,7 @@ app.put('/contracts/:id', auth(['ADMIN']), async (req, res) => {
 
     res.json(await enrichContract(contract));
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao atualizar contrato.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao atualizar contrato.') });
   }
 });
 
@@ -1017,7 +1089,7 @@ app.post('/contracts/:id/renegotiate', auth(['ADMIN']), async (req, res) => {
       installmentCount: z.coerce.number().int().positive(),
       contractStartDate: z.string(),
       interestRate: z.coerce.number().min(0),
-      notes: z.string().optional().nullable()
+      notes: z.string().max(2000).optional().nullable()
     });
 
     const data = schema.parse(req.body);
@@ -1091,12 +1163,25 @@ app.post('/contracts/:id/renegotiate', auth(['ADMIN']), async (req, res) => {
 
     res.status(201).json(await enrichContract(newContract));
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao renegociar contrato.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao renegociar contrato.') });
   }
 });
 
 app.delete('/contracts/:id', auth(['ADMIN']), async (req, res) => {
   try {
+    const contract = await prisma.contract.findUnique({
+      where: { id: req.params.id },
+      include: { payments: { take: 1 }, customer: { select: { name: true } } }
+    });
+
+    if (!contract) return res.status(404).json({ message: 'Contrato não encontrado.' });
+
+    if (contract.payments.length > 0) {
+      return res.status(400).json({
+        message: 'Não é possível excluir um contrato com pagamentos registrados. Exclua os pagamentos antes de remover o contrato.'
+      });
+    }
+
     await prisma.contract.delete({ where: { id: req.params.id } });
 
     await writeAuditLog({
@@ -1104,12 +1189,12 @@ app.delete('/contracts/:id', auth(['ADMIN']), async (req, res) => {
       action: 'DELETE',
       entityType: 'CONTRACT',
       entityId: req.params.id,
-      description: 'Contrato excluído.'
+      description: `Contrato "${contract.product}" do cliente ${contract.customer?.name} excluído.`
     });
 
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao excluir contrato.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao excluir contrato.') });
   }
 });
 
@@ -1144,10 +1229,10 @@ app.get('/assignments', auth(), async (req, res) => {
 app.post('/assignments', auth(['ADMIN']), async (req, res) => {
   try {
     const schema = z.object({
-      contractId: z.string().min(1),
-      collectorId: z.string().min(1),
+      contractId: z.string().min(1).max(100),
+      collectorId: z.string().min(1).max(100),
       targetAmount: z.coerce.number().min(0).optional().nullable(),
-      notes: z.string().optional().nullable()
+      notes: z.string().max(2000).optional().nullable()
     });
 
     const data = schema.parse(req.body);
@@ -1180,15 +1265,15 @@ app.post('/assignments', auth(['ADMIN']), async (req, res) => {
       contract: await enrichContract(assignment.contract)
     });
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao distribuir contrato.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao distribuir contrato.') });
   }
 });
 
 app.post('/distribution/bulk', auth(['ADMIN']), async (req, res) => {
   try {
     const schema = z.object({
-      collectorId: z.string().min(1),
-      contractIds: z.array(z.string().min(1)).min(1)
+      collectorId: z.string().min(1).max(100),
+      contractIds: z.array(z.string().min(1).max(100)).min(1)
     });
 
     const data = schema.parse(req.body);
@@ -1216,7 +1301,7 @@ app.post('/distribution/bulk', auth(['ADMIN']), async (req, res) => {
 
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro na distribuição em lote.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro na distribuição em lote.') });
   }
 });
 
@@ -1249,24 +1334,25 @@ app.get('/distribution/collectors', auth(['ADMIN']), async (_req, res) => {
 
 app.get('/distribution/available-contracts', auth(['ADMIN']), async (_req, res) => {
   const contracts = await prisma.contract.findMany({
+    where: {
+      status: { not: 'QUITADO' },
+      assignments: { none: {} }
+    },
     include: {
       customer: true,
       assignments: true,
       installments: true,
       payments: true
     },
-    orderBy: { createdAt: 'desc' }
+    orderBy: { createdAt: 'desc' },
+    take: 500
   });
 
   const enrichedContracts = await Promise.all(contracts.map(enrichContract));
 
   res.json(
     enrichedContracts
-      .filter((c) =>
-        c.status !== 'QUITADO' &&
-        Number(c.pendingAmount || 0) > 0 &&
-        (!c.assignments || c.assignments.length === 0)
-      )
+      .filter((c) => Number(c.pendingAmount || 0) > 0)
       .map((c) => ({
         id: c.id,
         product: c.product,
@@ -1285,9 +1371,9 @@ app.get('/distribution/available-contracts', auth(['ADMIN']), async (_req, res) 
 app.put('/assignments/:id', auth(['ADMIN']), async (req, res) => {
   try {
     const schema = z.object({
-      collectorId: z.string().min(1),
+      collectorId: z.string().min(1).max(100),
       targetAmount: z.coerce.number().min(0).optional().nullable(),
-      notes: z.string().optional().nullable()
+      notes: z.string().max(2000).optional().nullable()
     });
 
     const data = schema.parse(req.body);
@@ -1319,7 +1405,7 @@ app.put('/assignments/:id', auth(['ADMIN']), async (req, res) => {
       contract: await enrichContract(assignment.contract)
     });
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao atualizar distribuição.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao atualizar distribuição.') });
   }
 });
 
@@ -1337,49 +1423,54 @@ app.delete('/assignments/:id', auth(['ADMIN']), async (req, res) => {
 
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao remover distribuição.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao remover distribuição.') });
   }
 });
 
 app.get('/payments', auth(), async (req, res) => {
-  const q = req.query.q?.toString() || '';
+  const q = (req.query.q?.toString() || '').slice(0, 100);
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+  const skip = (page - 1) * limit;
+
   const where = {
     ...(req.user.role === 'COLLECTOR' ? { collectorId: req.user.sub } : {}),
     ...(q
       ? {
           OR: [
-            { contract: { customer: { name: { contains: q } } } },
-            { contract: { customer: { cpf: { contains: q } } } },
-            { contract: { product: { contains: q } } }
+            { contract: { customer: { name: { contains: q, mode: 'insensitive' } } } },
+            ...(q.replace(/\D/g, '') ? [{ contract: { customer: { cpf: { contains: q.replace(/\D/g, '') } } } }] : []),
+            { contract: { product: { contains: q, mode: 'insensitive' } } }
           ]
         }
       : {})
   };
 
-  const payments = await prisma.payment.findMany({
-    where,
-    include: {
-      collector: { select: { id: true, name: true, email: true } },
-      contract: {
-        include: {
-          customer: true,
-              installments: true,
-          payments: true
-        }
+  const [payments, total] = await Promise.all([
+    prisma.payment.findMany({
+      where,
+      include: {
+        collector: { select: { id: true, name: true, email: true } },
+        contract: {
+          select: {
+            id: true,
+            product: true,
+            financedAmount: true,
+            interestRate: true,
+            customerId: true,
+            customer: { select: { id: true, name: true, cpf: true, phone1: true } }
+          }
+        },
+        installment: true
       },
-      installment: true
-    },
-    orderBy: { paymentDate: 'desc' }
-  });
+      orderBy: { paymentDate: 'desc' },
+      skip,
+      take: limit
+    }),
+    prisma.payment.count({ where })
+  ]);
 
-  const enrichedPayments = await Promise.all(
-    payments.map(async (payment) => ({
-      ...payment,
-      contract: await enrichContract(payment.contract)
-    }))
-  );
-
-  res.json(enrichedPayments);
+  res.json({ data: payments, total, page, limit, pages: Math.ceil(total / limit) });
 });
 
 app.get('/payments/:id/receipt', auth(), async (req, res) => {
@@ -1465,20 +1556,20 @@ app.get('/payments/:id/receipt', auth(), async (req, res) => {
 
     doc.end();
   } catch (error) {
-    if (!res.headersSent) res.status(400).json({ message: error.message || 'Erro ao gerar comprovante.' });
+    if (!res.headersSent) res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao gerar comprovante.') });
   }
 });
 
 app.post('/payments', auth(['ADMIN', 'COLLECTOR']), async (req, res) => {
   try {
     const schema = z.object({
-      contractId: z.string().min(1),
+      contractId: z.string().min(1).max(100),
       installmentId: z.string().optional().nullable(),
-      amount: z.coerce.number().positive(),
+      amount: z.coerce.number().positive().max(9_999_999),
       paymentDate: z.string(),
       paymentMethod: z.enum(['PIX', 'DINHEIRO']),
-      notes: z.string().optional().nullable(),
-      collectorId: z.string().min(1)
+      notes: z.string().max(2000).optional().nullable(),
+      collectorId: z.string().min(1).max(100)
     });
 
     const data = schema.parse(req.body);
@@ -1519,48 +1610,46 @@ app.post('/payments', auth(['ADMIN', 'COLLECTOR']), async (req, res) => {
       return res.status(400).json({ message: 'O valor informado excede o saldo da parcela.' });
     }
 
-    const updatedInstallment = await prisma.installment.update({
-      where: { id: installment.id },
-      data: {
-        paidAmount: nextPaidAmount,
-        paidAt: nextPaidAmount >= Number(installment.amount) ? parseDate(data.paymentDate) : null,
-        status: normalizeInstallmentStatus({
-          ...installment,
-          paidAmount: nextPaidAmount
-        }),
-        updatedAt: new Date()
-      }
-    });
+    const payment = await prisma.$transaction(async (tx) => {
+      const updatedInstallment = await tx.installment.update({
+        where: { id: installment.id },
+        data: {
+          paidAmount: nextPaidAmount,
+          paidAt: nextPaidAmount >= Number(installment.amount) ? parseDate(data.paymentDate) : null,
+          status: normalizeInstallmentStatus({ ...installment, paidAmount: nextPaidAmount }),
+          updatedAt: new Date()
+        }
+      });
 
-    const payment = await prisma.payment.create({
-      data: {
-        contractId: data.contractId,
-        installmentId: updatedInstallment.id,
-        collectorId,
-        amount: data.amount,
-        paymentDate: parseDate(data.paymentDate),
-        paymentMethod: data.paymentMethod,
-        notes: data.notes || null,
-        receiptCode: `REC-${Date.now()}`
-      },
-      include: {
-        collector: { select: { id: true, name: true, email: true } },
-        contract: { include: { customer: true } },
-        installment: true
-      }
-    });
+      const created = await tx.payment.create({
+        data: {
+          contractId: data.contractId,
+          installmentId: updatedInstallment.id,
+          collectorId,
+          amount: data.amount,
+          paymentDate: parseDate(data.paymentDate),
+          paymentMethod: data.paymentMethod,
+          notes: data.notes || null,
+          receiptCode: `REC-${randomUUID()}`
+        },
+        include: {
+          collector: { select: { id: true, name: true, email: true } },
+          contract: { include: { customer: true } },
+          installment: true
+        }
+      });
 
-    const contract = await prisma.contract.findUnique({
-      where: { id: data.contractId },
-      include: { installments: true }
-    });
+      const contract = await tx.contract.findUnique({
+        where: { id: data.contractId },
+        include: { installments: true }
+      });
 
-    await prisma.contract.update({
-      where: { id: data.contractId },
-      data: {
-        status: normalizeContractStatus(contract),
-        updatedAt: new Date()
-      }
+      await tx.contract.update({
+        where: { id: data.contractId },
+        data: { status: normalizeContractStatus(contract), updatedAt: new Date() }
+      });
+
+      return created;
     });
 
     await writeAuditLog({
@@ -1581,7 +1670,7 @@ app.post('/payments', auth(['ADMIN', 'COLLECTOR']), async (req, res) => {
 
     res.status(201).json(payment);
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao registrar pagamento.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao registrar pagamento.') });
   }
 });
 
@@ -1598,15 +1687,19 @@ app.put('/payments/:id', auth(['ADMIN', 'COLLECTOR']), async (req, res) => {
     }
 
     const schema = z.object({
-      amount: z.coerce.number().positive(),
+      amount: z.coerce.number().positive().max(9_999_999),
       paymentDate: z.string(),
       paymentMethod: z.enum(['PIX', 'DINHEIRO']),
-      notes: z.string().optional().nullable(),
-      collectorId: z.string().min(1)
+      notes: z.string().max(2000).optional().nullable(),
+      // Apenas ADMIN pode alterar o cobrador; COLLECTOR sempre mantém o original
+      collectorId: z.string().min(1).max(100).optional()
     });
 
     const data = schema.parse(req.body);
-    const collectorId = req.user.role === 'COLLECTOR' ? req.user.sub : data.collectorId;
+    // COLLECTOR nunca pode mudar o collectorId — nem para si mesmo
+    const collectorId = req.user.role === 'COLLECTOR'
+      ? existing.collectorId
+      : (data.collectorId || existing.collectorId);
 
     if (existing.installmentId) {
       const installment = await prisma.installment.findUnique({
@@ -1625,11 +1718,15 @@ app.put('/payments/:id', auth(['ADMIN', 'COLLECTOR']), async (req, res) => {
         return res.status(400).json({ message: 'O valor informado excede o saldo da parcela.' });
       }
 
+      const nowFullyPaid = recalculatedPaidAmount >= Number(installment.amount);
       await prisma.installment.update({
         where: { id: installment.id },
         data: {
           paidAmount: recalculatedPaidAmount,
-          paidAt: recalculatedPaidAmount >= Number(installment.amount) ? parseDate(data.paymentDate) : null,
+          // Preserva paidAt original se já estava quitada; só zera se deixou de estar quitada
+          paidAt: nowFullyPaid
+            ? (installment.paidAt || parseDate(data.paymentDate))
+            : null,
           status: normalizeInstallmentStatus({
             ...installment,
             paidAmount: recalculatedPaidAmount
@@ -1679,7 +1776,7 @@ app.put('/payments/:id', auth(['ADMIN', 'COLLECTOR']), async (req, res) => {
 
     res.json(payment);
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao atualizar pagamento.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao atualizar pagamento.') });
   }
 });
 
@@ -1743,7 +1840,7 @@ app.delete('/payments/:id', auth(['ADMIN', 'COLLECTOR']), async (req, res) => {
 
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao excluir pagamento.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao excluir pagamento.') });
   }
 });
 
@@ -1835,7 +1932,7 @@ app.get('/cash-accounts/monthly', auth(['ADMIN']), async (req, res) => {
 
     res.json(result);
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao gerar prestação de contas mensal.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao gerar prestação de contas mensal.') });
   }
 });
 
@@ -1955,7 +2052,7 @@ app.get('/cash-accounts/monthly/receipt', auth(['ADMIN']), async (req, res) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(html);
   } catch (error) {
-    res.status(400).json({ message: error.message || 'Erro ao gerar comprovante mensal.' });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao gerar comprovante mensal.') });
   }
 });
 
@@ -2038,7 +2135,7 @@ app.get('/cash-accounts/monthly/receipt/pdf', auth(['ADMIN']), async (req, res) 
 
     doc.end();
   } catch (error) {
-    if (!res.headersSent) res.status(400).json({ message: error.message || 'Erro ao gerar PDF.' });
+    if (!res.headersSent) res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao gerar PDF.') });
   }
 });
 
@@ -2142,7 +2239,7 @@ app.get('/cash-accounts/monthly/receipt/excel', auth(['ADMIN']), async (req, res
     await workbook.xlsx.write(res);
     res.end();
   } catch (error) {
-    if (!res.headersSent) res.status(400).json({ message: error.message || 'Erro ao gerar Excel.' });
+    if (!res.headersSent) res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro ao gerar Excel.') });
   }
 });
 
@@ -2214,16 +2311,22 @@ app.get('/reports/payments.csv', auth(), async (req, res) => {
   res.send(toCsv(rows));
 });
 
-app.get('/audit-logs', auth(['ADMIN']), async (_req, res) => {
-  const logs = await prisma.auditLog.findMany({
-    include: {
-      user: { select: { id: true, name: true, email: true } }
-    },
-    orderBy: { createdAt: 'desc' },
-    take: 200
-  });
+app.get('/audit-logs', auth(['ADMIN']), async (req, res) => {
+  const page  = Math.max(1, parseInt(req.query.page)  || 1);
+  const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 100));
+  const skip  = (page - 1) * limit;
 
-  res.json(logs);
+  const [logs, total] = await Promise.all([
+    prisma.auditLog.findMany({
+      include: { user: { select: { id: true, name: true, email: true } } },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit
+    }),
+    prisma.auditLog.count()
+  ]);
+
+  res.json({ data: logs, total, page, limit, pages: Math.ceil(total / limit) });
 });
 
 
@@ -2268,27 +2371,26 @@ app.get('/dashboard/summary', auth(), async (req, res) => {
     include: { collector: { select: { id: true, name: true } } }
   });
 
-  // Cobranças programadas para o mês — parcelas pendentes com vencimento no mês atual
-  const cobrancasMes = await prisma.installment.count({
-    where: {
-      dueDate: { gte: monthStart, lte: monthEnd },
-      status: { not: 'PAGO' },
-      ...(req.user.role === 'COLLECTOR'
-        ? { contract: { assignments: { some: { collectorId: req.user.sub } } } }
-        : {})
-    }
-  });
+  // Cobranças programadas para o mês — parcelas não totalmente pagas com vencimento no mês
+  // Usa raw SQL pois Prisma não permite comparar duas colunas (paidAmount < amount)
+  const collectorFilterSql =
+    req.user.role === 'COLLECTOR'
+      ? Prisma.sql`AND i."contractId" IN (
+          SELECT c.id FROM "Contract" c
+          JOIN "Assignment" a ON a."contractId" = c.id
+          WHERE a."collectorId" = ${req.user.sub}
+        )`
+      : Prisma.empty;
 
-  const valorCobrancasMes = await prisma.installment.aggregate({
-    where: {
-      dueDate: { gte: monthStart, lte: monthEnd },
-      status: { not: 'PAGO' },
-      ...(req.user.role === 'COLLECTOR'
-        ? { contract: { assignments: { some: { collectorId: req.user.sub } } } }
-        : {})
-    },
-    _sum: { amount: true }
-  });
+  const cobrancasMesRaw = await prisma.$queryRaw`
+    SELECT COUNT(*)::int AS count, COALESCE(SUM(i.amount), 0)::float AS total
+    FROM "Installment" i
+    WHERE i."dueDate" >= ${monthStart} AND i."dueDate" <= ${monthEnd}
+      AND i."paidAmount" < i."amount"
+      ${collectorFilterSql}
+  `;
+  const cobrancasMes = cobrancasMesRaw[0]?.count ?? 0;
+  const valorCobrancasMesTotal = cobrancasMesRaw[0]?.total ?? 0;
 
   const paymentsMonth = await prisma.payment.findMany({
     where: {
@@ -2390,7 +2492,7 @@ app.get('/dashboard/summary', auth(), async (req, res) => {
     })),
     assignmentsToday: assignmentsToday.length,
     cobrancasMes,
-    valorCobrancasMes: Number((valorCobrancasMes._sum.amount || 0).toFixed(2))
+    valorCobrancasMes: Number(valorCobrancasMesTotal.toFixed(2))
   });
 });
 
@@ -2413,15 +2515,15 @@ app.get('/products', auth(), async (req, res) => {
     });
     res.json(products);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
 app.post('/products', auth(['ADMIN']), async (req, res) => {
   try {
     const schema = z.object({
-      name: z.string().min(2),
-      description: z.string().optional().nullable(),
+      name: z.string().min(2).max(100),
+      description: z.string().max(2000).optional().nullable(),
       unit: z.string().default('un'),
       packageUnit: z.string().optional().nullable(),
       packageQty: z.coerce.number().optional().nullable(),
@@ -2438,15 +2540,15 @@ app.post('/products', auth(['ADMIN']), async (req, res) => {
     await writeAuditLog({ userId: req.user.sub, action: 'CREATE', entityType: 'PRODUCT', entityId: product.id, description: `Produto ${product.name} criado.` });
     res.status(201).json(product);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
 app.put('/products/:id', auth(['ADMIN']), async (req, res) => {
   try {
     const schema = z.object({
-      name: z.string().min(2),
-      description: z.string().optional().nullable(),
+      name: z.string().min(2).max(100),
+      description: z.string().max(2000).optional().nullable(),
       unit: z.string().default('un'),
       packageUnit: z.string().optional().nullable(),
       packageQty: z.coerce.number().optional().nullable(),
@@ -2465,7 +2567,7 @@ app.put('/products/:id', auth(['ADMIN']), async (req, res) => {
     });
     res.json(product);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -2477,7 +2579,7 @@ app.delete('/products/:id', auth(['ADMIN']), async (req, res) => {
     });
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -2514,23 +2616,23 @@ app.get('/stock/movements', auth(['ADMIN']), async (req, res) => {
     });
     res.json(movements);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
 app.post('/stock/movements', auth(['ADMIN']), async (req, res) => {
   try {
     const schema = z.object({
-      productId: z.string().min(1),
+      productId: z.string().min(1).max(100),
       type: z.enum(['ENTRADA', 'SAIDA', 'AVARIA', 'TROCA', 'AJUSTE_POSITIVO', 'AJUSTE_NEGATIVO']),
       quantity: z.coerce.number().positive(),
       unitCost: z.coerce.number().min(0).default(0),
       salePrice: z.coerce.number().min(0).optional().nullable(),
-      destination: z.string().optional().nullable(),
+      destination: z.string().max(500).optional().nullable(),
       contractId: z.string().optional().nullable(),
       customerId: z.string().optional().nullable(),
-      reason: z.string().optional().nullable(),
-      notes: z.string().optional().nullable(),
+      reason: z.string().max(2000).optional().nullable(),
+      notes: z.string().max(2000).optional().nullable(),
     });
 
     const data = schema.parse(req.body);
@@ -2656,7 +2758,7 @@ app.post('/stock/movements', auth(['ADMIN']), async (req, res) => {
 
     res.status(201).json(movement);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -2730,7 +2832,7 @@ app.get('/stock/summary', auth(['ADMIN']), async (req, res) => {
       validadeProxima
     });
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -2755,7 +2857,7 @@ app.get('/baskets', auth(), async (req, res) => {
     });
     res.json(baskets);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -2763,8 +2865,8 @@ app.get('/baskets', auth(), async (req, res) => {
 app.post('/baskets', auth(['ADMIN']), async (req, res) => {
   try {
     const schema = z.object({
-      name: z.string().min(2),
-      description: z.string().optional().nullable(),
+      name: z.string().min(2).max(100),
+      description: z.string().max(2000).optional().nullable(),
       salePrice: z.coerce.number().min(0),
       items: z.array(z.object({
         productId: z.string(),
@@ -2812,7 +2914,7 @@ app.post('/baskets', auth(['ADMIN']), async (req, res) => {
     await writeAuditLog({ userId: req.user.sub, action: 'CREATE', entityType: 'BASKET', entityId: basket.id, description: `Cesta ${basket.name} criada.` });
     res.status(201).json(basket);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -2820,8 +2922,8 @@ app.post('/baskets', auth(['ADMIN']), async (req, res) => {
 app.put('/baskets/:id', auth(['ADMIN']), async (req, res) => {
   try {
     const schema = z.object({
-      name: z.string().min(2),
-      description: z.string().optional().nullable(),
+      name: z.string().min(2).max(100),
+      description: z.string().max(2000).optional().nullable(),
       salePrice: z.coerce.number().min(0),
       isActive: z.boolean().optional().default(true),
       items: z.array(z.object({
@@ -2868,7 +2970,7 @@ app.put('/baskets/:id', auth(['ADMIN']), async (req, res) => {
 
     res.json(basket);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -2881,7 +2983,7 @@ app.delete('/baskets/:id', auth(['ADMIN']), async (req, res) => {
     });
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -2893,11 +2995,11 @@ app.post('/baskets/movements', auth(['ADMIN']), async (req, res) => {
       type: z.enum(['MONTAGEM', 'VENDA', 'DESMONTAGEM', 'AVARIA', 'AJUSTE_POSITIVO', 'AJUSTE_NEGATIVO']),
       quantity: z.coerce.number().positive(),
       salePrice: z.coerce.number().min(0).optional().nullable(),
-      destination: z.string().optional().nullable(),
+      destination: z.string().max(500).optional().nullable(),
       customerId: z.string().optional().nullable(),
       contractId: z.string().optional().nullable(),
-      reason: z.string().optional().nullable(),
-      notes: z.string().optional().nullable(),
+      reason: z.string().max(2000).optional().nullable(),
+      notes: z.string().max(2000).optional().nullable(),
     });
     const data = schema.parse(req.body);
 
@@ -2993,7 +3095,7 @@ app.post('/baskets/movements', auth(['ADMIN']), async (req, res) => {
     await writeAuditLog({ userId: req.user.sub, action: data.type, entityType: 'BASKET', entityId: basket.id, description: `${data.type} de ${data.quantity}x ${basket.name}.` });
     res.status(201).json(movement);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -3045,7 +3147,7 @@ app.get('/baskets/summary', auth(['ADMIN']), async (req, res) => {
       valorEstoqueVenda: Number(valorEstoqueVenda.toFixed(2)),
     });
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -3058,7 +3160,7 @@ app.post('/stock/movements/adjust', auth(['ADMIN']), async (req, res) => {
       type: z.enum(['AJUSTE_POSITIVO', 'AJUSTE_NEGATIVO']),
       quantity: z.coerce.number().positive(),
       reason: z.string().min(1, 'Motivo obrigatório.'),
-      notes: z.string().optional().nullable(),
+      notes: z.string().max(2000).optional().nullable(),
     });
     const data = schema.parse(req.body);
 
@@ -3091,7 +3193,7 @@ app.post('/stock/movements/adjust', auth(['ADMIN']), async (req, res) => {
     await writeAuditLog({ userId: req.user.sub, action: data.type, entityType: 'STOCK', entityId: movement.id, description: `Ajuste de ${data.quantity} ${product.unit} em ${product.name}: ${data.reason}` });
     res.status(201).json(movement);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -3102,9 +3204,9 @@ app.put('/stock/movements/:id', auth(['ADMIN']), async (req, res) => {
       quantity: z.coerce.number().positive(),
       unitCost: z.coerce.number().min(0).optional(),
       salePrice: z.coerce.number().min(0).optional().nullable(),
-      destination: z.string().optional().nullable(),
-      reason: z.string().optional().nullable(),
-      notes: z.string().optional().nullable(),
+      destination: z.string().max(500).optional().nullable(),
+      reason: z.string().max(2000).optional().nullable(),
+      notes: z.string().max(2000).optional().nullable(),
     });
     const data = schema.parse(req.body);
 
@@ -3157,7 +3259,7 @@ app.put('/stock/movements/:id', auth(['ADMIN']), async (req, res) => {
 
     res.json(movement);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -3169,7 +3271,7 @@ app.post('/baskets/movements/adjust', auth(['ADMIN']), async (req, res) => {
       type: z.enum(['AJUSTE_POSITIVO', 'AJUSTE_NEGATIVO']),
       quantity: z.coerce.number().positive(),
       reason: z.string().min(1, 'Motivo obrigatório.'),
-      notes: z.string().optional().nullable(),
+      notes: z.string().max(2000).optional().nullable(),
     });
     const data = schema.parse(req.body);
 
@@ -3202,7 +3304,7 @@ app.post('/baskets/movements/adjust', auth(['ADMIN']), async (req, res) => {
     await writeAuditLog({ userId: req.user.sub, action: data.type, entityType: 'BASKET', entityId: basket.id, description: `Ajuste de ${data.quantity}x ${basket.name}: ${data.reason}` });
     res.status(201).json(movement);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -3212,9 +3314,9 @@ app.put('/baskets/movements/:id', auth(['ADMIN']), async (req, res) => {
     const schema = z.object({
       quantity: z.coerce.number().positive(),
       salePrice: z.coerce.number().min(0).optional().nullable(),
-      destination: z.string().optional().nullable(),
-      reason: z.string().optional().nullable(),
-      notes: z.string().optional().nullable(),
+      destination: z.string().max(500).optional().nullable(),
+      reason: z.string().max(2000).optional().nullable(),
+      notes: z.string().max(2000).optional().nullable(),
     });
     const data = schema.parse(req.body);
 
@@ -3253,7 +3355,7 @@ app.put('/baskets/movements/:id', auth(['ADMIN']), async (req, res) => {
 
     res.json(movement);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -3281,7 +3383,7 @@ app.get('/baskets/history', auth(['ADMIN']), async (req, res) => {
     });
     res.json(movements);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -3322,7 +3424,7 @@ app.post('/stock/movements/:id/reverse', auth(['ADMIN']), async (req, res) => {
     await writeAuditLog({ userId: req.user.sub, action: 'ESTORNO', entityType: 'STOCK', entityId: movement.id, description: `Estorno de ${movement.quantity} de ${movement.product.name}.` });
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -3332,7 +3434,7 @@ app.delete('/stock/movements/:id', auth(['ADMIN']), async (req, res) => {
     await prisma.stockMovement.delete({ where: { id: req.params.id } });
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -3371,7 +3473,7 @@ app.post('/baskets/movements/:id/reverse', auth(['ADMIN']), async (req, res) => 
     await writeAuditLog({ userId: req.user.sub, action: 'ESTORNO', entityType: 'BASKET', entityId: movement.id, description: `Estorno de ${movement.quantity}x ${movement.basket.name}.` });
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -3381,7 +3483,7 @@ app.delete('/baskets/movements/:id', auth(['ADMIN']), async (req, res) => {
     await prisma.basketMovement.delete({ where: { id: req.params.id } });
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -3427,7 +3529,7 @@ app.delete('/stock/movements/:id/delete-with-reverse', auth(['ADMIN']), async (r
     await writeAuditLog({ userId: req.user.sub, action: 'DELETE', entityType: 'STOCK', entityId: req.params.id, description: `Movimentação excluída com estorno de ${movement.quantity} de ${movement.product.name}.` });
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -3476,7 +3578,7 @@ app.delete('/baskets/movements/:id/delete-with-reverse', auth(['ADMIN']), async 
     await writeAuditLog({ userId: req.user.sub, action: 'DELETE', entityType: 'BASKET', entityId: req.params.id, description: `Movimentação excluída com estorno de ${movement.quantity}x ${movement.basket.name}.` });
     res.json({ ok: true });
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') });
   }
 });
 
@@ -3488,22 +3590,37 @@ app.delete('/baskets/movements/:id/delete-with-reverse', auth(['ADMIN']), async 
 app.get('/spc', auth(['ADMIN']), async (req, res) => {
   try {
     const status = req.query.status?.toString() || '';
-    const q = req.query.q?.toString() || '';
-    const records = await prisma.spcRecord.findMany({
-      where: {
-        ...(status ? { status } : {}),
-        ...(q ? { OR: [{ customer: { name: { contains: q } } }, { customer: { cpf: { contains: q } } }] } : {})
-      },
-      include: {
-        customer: { select: { id: true, name: true, cpf: true, phone1: true, phone2: true } },
-        contract: { select: { id: true, product: true, financedAmount: true } },
-        createdBy: { select: { id: true, name: true } },
-        agreements: true
-      },
-      orderBy: { includeDate: 'desc' }
-    });
-    res.json(records);
-  } catch (error) { res.status(400).json({ message: error.message }); }
+    const q = (req.query.q?.toString() || '').slice(0, 100);
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 100));
+    const skip  = (page - 1) * limit;
+
+    const where = {
+      ...(status ? { status } : {}),
+      ...(q ? { OR: [
+        { customer: { name: { contains: q, mode: 'insensitive' } } },
+        ...(q.replace(/\D/g, '') ? [{ customer: { cpf: { contains: q.replace(/\D/g, '') } } }] : [])
+      ] } : {})
+    };
+
+    const [records, total] = await Promise.all([
+      prisma.spcRecord.findMany({
+        where,
+        include: {
+          customer: { select: { id: true, name: true, cpf: true, phone1: true, phone2: true } },
+          contract: { select: { id: true, product: true, financedAmount: true } },
+          createdBy: { select: { id: true, name: true } },
+          agreements: true
+        },
+        orderBy: { includeDate: 'desc' },
+        skip,
+        take: limit
+      }),
+      prisma.spcRecord.count({ where })
+    ]);
+
+    res.json({ data: records, total, page, limit, pages: Math.ceil(total / limit) });
+  } catch (error) { res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') }); }
 });
 
 app.get('/spc/summary', auth(['ADMIN']), async (req, res) => {
@@ -3512,24 +3629,43 @@ app.get('/spc/summary', auth(['ADMIN']), async (req, res) => {
     const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
     const monthEnd   = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0, 23, 59, 59));
     const alertDate  = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-    const [ativos, baixadosMes] = await Promise.all([
-      prisma.spcRecord.findMany({ where: { status: { not: 'BAIXADO' } } }),
-      prisma.spcRecord.findMany({ where: { status: 'BAIXADO', removedDate: { gte: monthStart, lte: monthEnd } } }),
+
+    const [
+      totalAtivos,
+      totalAcordos,
+      valorAgg,
+      baixadosMesAgg,
+      vencendo
+    ] = await Promise.all([
+      prisma.spcRecord.count({ where: { status: 'ATIVO' } }),
+      prisma.spcRecord.count({ where: { status: 'ACORDO' } }),
+      prisma.spcRecord.aggregate({
+        where: { status: { not: 'BAIXADO' } },
+        _sum: { debtAmount: true, originalDebt: true }
+      }),
+      prisma.spcRecord.aggregate({
+        where: { status: 'BAIXADO', removedDate: { gte: monthStart, lte: monthEnd } },
+        _sum: { originalDebt: true },
+        _count: { id: true }
+      }),
+      prisma.spcRecord.count({ where: { status: 'ATIVO', expireDate: { lte: alertDate } } })
     ]);
-    const vencendo = await prisma.spcRecord.findMany({ where: { status: 'ATIVO', expireDate: { lte: alertDate } } });
-    const totalAtivos    = ativos.filter(r => r.status === 'ATIVO').length;
-    const totalAcordos   = ativos.filter(r => r.status === 'ACORDO').length;
-    const valorTotal     = ativos.reduce((s, r) => s + r.debtAmount, 0);
-    const valorOriginal  = ativos.reduce((s, r) => s + r.originalDebt, 0);
-    const valorBaixadoMes = baixadosMes.reduce((s, r) => s + r.originalDebt, 0);
-    const taxaRecuperacao = valorOriginal > 0 ? Number(((valorBaixadoMes / valorOriginal) * 100).toFixed(1)) : 0;
-    res.json({ totalAtivos, totalAcordos, totalBaixadosMes: baixadosMes.length, valorTotal: Number(valorTotal.toFixed(2)), valorOriginal: Number(valorOriginal.toFixed(2)), valorBaixadoMes: Number(valorBaixadoMes.toFixed(2)), taxaRecuperacao, vencendo: vencendo.length });
-  } catch (error) { res.status(400).json({ message: error.message }); }
+
+    const valorTotal       = Number((valorAgg._sum.debtAmount    || 0).toFixed(2));
+    const valorOriginal    = Number((valorAgg._sum.originalDebt  || 0).toFixed(2));
+    const valorBaixadoMes  = Number((baixadosMesAgg._sum.originalDebt || 0).toFixed(2));
+    const totalBaixadosMes = baixadosMesAgg._count.id;
+    const taxaRecuperacao  = valorOriginal > 0
+      ? Number(((valorBaixadoMes / valorOriginal) * 100).toFixed(1))
+      : 0;
+
+    res.json({ totalAtivos, totalAcordos, totalBaixadosMes, valorTotal, valorOriginal, valorBaixadoMes, taxaRecuperacao, vencendo });
+  } catch (error) { res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') }); }
 });
 
 app.post('/spc', auth(['ADMIN']), async (req, res) => {
   try {
-    const schema = z.object({ customerId: z.string().min(1), contractId: z.string().optional().nullable(), debtAmount: z.coerce.number().positive(), reason: z.string().optional().nullable(), notes: z.string().optional().nullable(), includeDate: z.string().optional().nullable() });
+    const schema = z.object({ customerId: z.string().min(1).max(100), contractId: z.string().optional().nullable(), debtAmount: z.coerce.number().positive(), reason: z.string().max(2000).optional().nullable(), notes: z.string().max(2000).optional().nullable(), includeDate: z.string().optional().nullable() });
     const data = schema.parse(req.body);
     const existing = await prisma.spcRecord.findFirst({ where: { customerId: data.customerId, status: { not: 'BAIXADO' } } });
     if (existing) return res.status(400).json({ message: 'Este cliente ja possui um registro ativo no SPC.' });
@@ -3539,23 +3675,28 @@ app.post('/spc', auth(['ADMIN']), async (req, res) => {
     const record = await prisma.spcRecord.create({ data: { customerId: data.customerId, contractId: data.contractId || null, debtAmount: data.debtAmount, originalDebt: data.debtAmount, reason: data.reason || null, notes: data.notes || null, includeDate, expireDate, createdById: req.user.sub }, include: { customer: { select: { id: true, name: true, cpf: true } }, agreements: true } });
     await writeAuditLog({ userId: req.user.sub, action: 'CREATE', entityType: 'SPC', entityId: record.id, description: `Cliente ${record.customer.name} incluido no SPC. Divida: R$ ${data.debtAmount.toFixed(2)}` });
     res.status(201).json(record);
-  } catch (error) { res.status(400).json({ message: error.message }); }
+  } catch (error) { res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') }); }
 });
 
 app.put('/spc/:id/baixar', auth(['ADMIN']), async (req, res) => {
   try {
-    const schema = z.object({ removedReason: z.string().min(1), notes: z.string().optional().nullable() });
+    const schema = z.object({ removedReason: z.string().min(1).max(100), notes: z.string().max(2000).optional().nullable() });
     const data = schema.parse(req.body);
 
     const spcRecord = await prisma.spcRecord.findUnique({ where: { id: req.params.id }, include: { customer: true } });
     if (!spcRecord) return res.status(404).json({ message: 'Registro não encontrado.' });
 
-    const record = await prisma.spcRecord.update({ where: { id: req.params.id }, data: { status: 'BAIXADO', removedDate: new Date(), removedReason: data.removedReason, notes: data.notes || null, updatedAt: new Date() }, include: { customer: true } });
+    // Toda a operação de baixa é atômica: se qualquer etapa falhar, nada é persistido
+    const record = await prisma.$transaction(async (tx) => {
+      const updated = await tx.spcRecord.update({
+        where: { id: req.params.id },
+        data: { status: 'BAIXADO', removedDate: new Date(), removedReason: data.removedReason, notes: data.notes || null, updatedAt: new Date() },
+        include: { customer: true }
+      });
 
-    // Creditar saldo baixado nas parcelas atrasadas do contrato vinculado
-    if (spcRecord.contractId) {
-      try {
-        const contract = await prisma.contract.findUnique({
+      // Creditar saldo baixado nas parcelas do contrato vinculado
+      if (spcRecord.contractId) {
+        const contract = await tx.contract.findUnique({
           where: { id: spcRecord.contractId },
           include: { installments: { orderBy: { number: 'asc' } } }
         });
@@ -3572,7 +3713,7 @@ app.put('/spc/:id/baixar', auth(['ADMIN']), async (req, res) => {
             if (instBalance <= 0) continue;
             const toPay = Number(Math.min(remaining, instBalance).toFixed(2));
             const newPaidAmount = Number((Number(inst.paidAmount || 0) + toPay).toFixed(2));
-            await prisma.installment.update({
+            await tx.installment.update({
               where: { id: inst.id },
               data: {
                 paidAmount: newPaidAmount,
@@ -3581,7 +3722,7 @@ app.put('/spc/:id/baixar', auth(['ADMIN']), async (req, res) => {
                 updatedAt: today
               }
             });
-            await prisma.payment.create({
+            await tx.payment.create({
               data: {
                 contractId: spcRecord.contractId,
                 installmentId: inst.id,
@@ -3590,56 +3731,61 @@ app.put('/spc/:id/baixar', auth(['ADMIN']), async (req, res) => {
                 paymentDate: today,
                 paymentMethod: 'DINHEIRO',
                 notes: `Crédito de baixa SPC — ${data.removedReason}`,
-                receiptCode: `SPC-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`
+                receiptCode: `SPC-${randomUUID()}`
               }
             });
             remaining = Number((remaining - toPay).toFixed(2));
           }
-          const updatedContract = await prisma.contract.findUnique({ where: { id: spcRecord.contractId }, include: { installments: true } });
-          await prisma.contract.update({ where: { id: spcRecord.contractId }, data: { status: normalizeContractStatus(updatedContract), updatedAt: today } });
+          const updatedContract = await tx.contract.findUnique({ where: { id: spcRecord.contractId }, include: { installments: true } });
+          await tx.contract.update({ where: { id: spcRecord.contractId }, data: { status: normalizeContractStatus(updatedContract), updatedAt: today } });
         }
-      } catch (payError) {
-        console.error('Erro ao aplicar crédito SPC no contrato:', payError.message);
       }
-    }
 
+      return updated;
+    });
+
+    // Auditlog fora da transação — não deve ser desfeito se ocorrer erro posterior
     await writeAuditLog({ userId: req.user.sub, action: 'UPDATE', entityType: 'SPC', entityId: record.id, description: `SPC baixado para ${record.customer.name}. Motivo: ${data.removedReason}` });
     res.json(record);
-  } catch (error) { res.status(400).json({ message: error.message }); }
+  } catch (error) { res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') }); }
 });
 
 app.post('/spc/:id/acordo', auth(['ADMIN']), async (req, res) => {
   try {
-    const schema = z.object({ agreedAmount: z.coerce.number().positive(), installments: z.coerce.number().int().min(1).default(1), dueDate: z.string(), notes: z.string().optional().nullable() });
+    const schema = z.object({ agreedAmount: z.coerce.number().positive(), installments: z.coerce.number().int().min(1).default(1), dueDate: z.string(), notes: z.string().max(2000).optional().nullable() });
     const data = schema.parse(req.body);
     const agreement = await prisma.spcAgreement.create({ data: { spcRecordId: req.params.id, agreedAmount: data.agreedAmount, installments: data.installments, dueDate: new Date(data.dueDate), notes: data.notes || null } });
     await prisma.spcRecord.update({ where: { id: req.params.id }, data: { status: 'ACORDO', updatedAt: new Date() } });
     res.status(201).json(agreement);
-  } catch (error) { res.status(400).json({ message: error.message }); }
+  } catch (error) { res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') }); }
 });
 
 app.put('/spc/:id', auth(['ADMIN']), async (req, res) => {
   try {
-    const schema = z.object({ debtAmount: z.coerce.number().positive(), reason: z.string().optional().nullable(), notes: z.string().optional().nullable() });
+    const schema = z.object({ debtAmount: z.coerce.number().positive(), reason: z.string().max(2000).optional().nullable(), notes: z.string().max(2000).optional().nullable() });
     const data = schema.parse(req.body);
     const record = await prisma.spcRecord.update({ where: { id: req.params.id }, data: { debtAmount: data.debtAmount, reason: data.reason || null, notes: data.notes || null, updatedAt: new Date() } });
     res.json(record);
-  } catch (error) { res.status(400).json({ message: error.message }); }
+  } catch (error) { res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') }); }
 });
 
 app.delete('/spc/:id', auth(['ADMIN']), async (req, res) => {
   try {
     await prisma.spcRecord.delete({ where: { id: req.params.id } });
     res.json({ ok: true });
-  } catch (error) { res.status(400).json({ message: error.message }); }
+  } catch (error) { res.status(getErrorStatus(error)).json({ message: safeErrorMessage(error, 'Erro interno.') }); }
 });
 
+// ── Helper para extrair mensagem segura de um erro ───────────────
+// Erros de validação Zod e mensagens de negócio são expostos ao cliente.
 app.use((err, _req, res, _next) => {
   console.error(err);
   res.status(500).json({ message: 'Erro interno do servidor.' });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`API rodando em http://0.0.0.0:${PORT}`);
+// Escuta apenas em localhost — o Nginx faz o proxy externo
+const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
+app.listen(PORT, BIND_HOST, () => {
+  console.log(`API rodando em http://${BIND_HOST}:${PORT}`);
 });

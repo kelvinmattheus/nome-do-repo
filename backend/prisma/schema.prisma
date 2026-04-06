@@ -80,6 +80,9 @@ model Contract {
   stockMovements       StockMovement[]
   basketMovements      BasketMovement[]
   spcRecords           SpcRecord[]
+
+  @@index([customerId])
+  @@index([status])
 }
 
 model Installment {
@@ -97,6 +100,7 @@ model Installment {
   payments    Payment[]
 
   @@unique([contractId, number])
+  @@index([dueDate])
 }
 
 model Assignment {
@@ -112,6 +116,7 @@ model Assignment {
   collector    User     @relation(fields: [collectorId], references: [id], onDelete: Cascade)
 
   @@unique([contractId, collectorId])
+  @@index([collectorId])
 }
 
 model Payment {
@@ -129,6 +134,10 @@ model Payment {
   contract      Contract     @relation(fields: [contractId], references: [id], onDelete: Cascade)
   collector     User         @relation(fields: [collectorId], references: [id], onDelete: Cascade)
   installment   Installment? @relation(fields: [installmentId], references: [id], onDelete: SetNull)
+
+  @@index([collectorId])
+  @@index([paymentDate])
+  @@index([contractId])
 }
 
 model AuditLog {
@@ -141,6 +150,9 @@ model AuditLog {
   metadata    String?
   createdAt   DateTime @default(now())
   user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([entityType])
+  @@index([createdAt])
 }
 
 model Product {
@@ -251,6 +263,10 @@ model SpcRecord {
   contract      Contract?      @relation(fields: [contractId], references: [id], onDelete: SetNull)
   createdBy     User?          @relation(fields: [createdById], references: [id], onDelete: SetNull)
   agreements    SpcAgreement[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([expireDate])
 }
 
 model SpcAgreement {

@@ -4,7 +4,10 @@ node_modules/
 
 # Variáveis de ambiente (NUNCA commitar .env com dados reais)
 .env
+.env.*
 backend/.env
+frontend/.env.production
+frontend/.env.local
 frontend-next/.env.local
 
 # Build Next.js
